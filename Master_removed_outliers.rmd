@@ -1,0 +1,2064 @@
+---
+title: "DEseq 2.0"
+author: "Frederik Labonté"
+date: "2023-01-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+
+library(digest)
+library(biomaRt)
+library(clusterProfiler) 
+library(GO.db)
+library(org.Hs.eg.db)
+library(GOplot)
+
+library(reshape2)
+
+library("tidyverse")
+library("DESeq2")
+library("pheatmap")
+library("ggVennDiagram")
+```
+
+```{r making one big Matrix}
+# loadin in the data
+nm2 <- list.files(path="C:/Users/Frederik/Desktop/Rawdata/A549", full.names = T)
+A549_total = lapply(nm2, function(x) read.csv(file = x, row.names=1))
+names(A549_total) = gsub(".csv","",list.files(path="C:/Users/Frederik/Desktop/Rawdata/A549", full.names = F)) 
+Metadata_colnames = c("Hypoxie","Radiation","Time","Batch") #col names for metadata
+
+# function to make a big df with each sample and get the meta data
+df_from_list = function(df_list,start=2,end=7){
+a = df_list[[1]]
+for(i in start:end){
+  a = full_join(df_list[[i]],a, by = "ID")
+}
+
+my_df = a
+# Find the Duplicated Columns
+duplicated_columns <- duplicated(sapply(my_df, digest))
+
+# Show the Names of the Duplicated Columns
+colnames(my_df[duplicated_columns])
+
+# Remove the Duplicated Columns
+my_df = my_df[!duplicated_columns]
+colnames(my_df) = gsub(".x","",colnames(my_df))
+rownames(my_df) = my_df$ID
+my_df$ID = NULL
+
+x = my_df
+Metadata_my_df = t(as.data.frame(str_split(colnames(x),"\\."), row.names = Metadata_colnames, col.names = colnames(x)))
+res = list(x ,Metadata_my_df)
+return(res)
+}
+
+# Adding ID and running the necessary steps to get one df
+list_xray = lapply(A549_total[1:7],function(x) cbind(x,"ID" = rownames(x))) %>% df_from_list()
+names(list_xray) = c("df","meta")
+
+list_cion = lapply(A549_total[8:14],function(x) cbind(x,"ID" = rownames(x))) %>% df_from_list()
+names(list_cion) = c("df","meta")
+
+
+
+### checking that the overall amount of reads in each sample and set of samples is comparable 
+sumfun<-function(x,start,end){
+  return(sum(x[start:end]))
+}
+totalreads = function(x){
+vec = c()
+vec[1] = sumfun(x,1,4)
+for (i in 0:4){
+vec[i+2]=  sumfun(x,((i+1)*4)+1,(i+2)*4)
+}
+return(vec)
+}
+cols_xray = colSums(list_xray[[1]]) %>% totalreads()
+cols_cion = colSums(list_cion[[1]]) %>% totalreads()
+
+
+```
+
+```{r}
+list_cion2 = list_cion
+list_cion2$meta[,4] = as.numeric(list_cion2$meta[,4]) + 4
+
+i = 1
+for(entry in list_cion2$meta[,2]){
+  if(entry == "8Gy"){ 
+    list_cion2$meta[,2][i] = paste0(entry,"_c")
+  }
+  i = i+1
+  }
+rownames(list_cion2$meta) = paste0(gsub("8Gy","8Gy_c",rownames(list_cion2$meta)),".c")
+colnames(list_cion2$df) = paste0(gsub("8Gy","8Gy_c",colnames(list_cion2$df)),".c")
+df_total = cbind(list_xray$df,list_cion2$df)
+meta_total = rbind(list_xray$meta,list_cion2$meta)
+list_total = list(df_total,meta_total)
+names(list_total) = c("df","meta")
+```
+
+```{r remove the outliers }
+
+list_total$df <- dplyr::select(list_total$df, - c("H.0Gy.4h.3.c", "R.0Gy.4h.3","N.0Gy.4h.4.c")) #,"H.0Gy.4h.4.c"
+list_cion$df <- dplyr::select(list_cion$df, - c("H.0Gy.4h.3", "N.0Gy.4h.4")) 
+list_xray$df <- dplyr::select(list_xray$df, - c("R.0Gy.4h.3"))
+
+list_total$meta = subset(list_total$meta,!rownames(list_total$meta) %in% c("H.0Gy.4h.3.c", "R.0Gy.4h.3","N.0Gy.4h.4.c")) #,"H.0Gy.4h.4.c"
+list_cion$meta = subset(list_cion$meta,!rownames(list_cion$meta) %in% c("H.0Gy.4h.3", "N.0Gy.4h.4"))
+list_xray$meta = subset(list_xray$meta,!rownames(list_xray$meta) %in% c("R.0Gy.4h.3"))
+```
+
+```{r Deseq2}
+dds <- DESeqDataSetFromMatrix(countData = list_xray[[1]] ,
+                              colData = list_xray[[2]],
+                              design = ~Batch + Radiation + Hypoxie)
+dds$group <- factor(paste0(dds$Hypoxie, dds$Radiation ))
+design(dds) <- ~ Batch + group
+keep <- rowSums(counts(dds)) > 30 #why 30 ? in the original comparisions which were 8 samples we used 10 as a cut off now that they are combined we have 24 samples which is the same as 3*8 so i increased the filter by times 3
+dds <- dds[keep,]
+dds = estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# now for cion
+dds_c <- DESeqDataSetFromMatrix(countData = list_cion[[1]] ,
+                              colData = list_cion[[2]],
+                              design = ~Batch + Radiation + Hypoxie)
+dds_c$group <- factor(paste0(dds_c$Hypoxie, dds_c$Radiation ))
+design(dds_c) <- ~ Batch + group
+keep <- rowSums(counts(dds_c)) > 30 #why 30 ? in the original comparisions which were 8 samples we used 10 as a cut off now that they are combined we have 24 samples which is the same as 3*8 so i increased the filter by times 3
+dds_c <- dds_c[keep,]
+dds_c = estimateSizeFactors(dds_c)
+dds_c <- DESeq(dds_c)
+
+
+#for the combined experiments treating the differences as batch effect
+dds_t <- DESeqDataSetFromMatrix(countData = list_total[[1]] ,
+                              colData = list_total[[2]],
+                              design = ~Batch + Radiation + Hypoxie)
+dds_t$group <- factor(paste0(dds_t$Hypoxie, dds_t$Radiation ))
+design(dds_t) <- ~ Batch + group
+keep <- rowSums(counts(dds_t)) > 60 #why 60 ? in the original comparisions which were 8 samples we used 10 as a cut off now that they are combined we have 48 samples which is the same as 6*8 so i increased the filter by times 6
+dds_t <- dds_t[keep,]
+dds_t = estimateSizeFactors(dds_t)
+dds_t <- DESeq(dds_t)
+```
+
+```{r comparing between groups}
+
+#we create a function which does all the comparing for us between groups
+group_comparisions = function(x = dds, y = levels(dds$group)){ 
+  res_list = list()
+  lev = y
+  List_names = c()
+  nr = 0
+
+  # Function to compare group names
+  compare_names = function(name1, name2){
+    name1_has_zero = grepl('0', name1)
+    name2_has_zero = grepl('0', name2)
+    name1_is_n = grepl('^N', name1)
+    name2_is_n = grepl('^N', name2)
+    name1_is_r = grepl('^R', name1)
+    name2_is_r = grepl('^R', name2)
+
+    # Check if either the number or the letter is the same
+    if (!(substr(name1, 1, 1) == substr(name2, 1, 1) || substr(name1, 2, 3) == substr(name2, 2, 3))){
+      return(c())
+    }
+
+    # Rule 1: Groups with '0' always come second
+    if (name1_has_zero && !name2_has_zero) {
+      return(c(name2, name1))
+    } else if (name2_has_zero && !name1_has_zero) {
+      return(c(name1, name2))
+    }
+
+    # Rule 2: if there is no '0' or both contain a '0', 'N' comes second
+    if (!name1_is_n && name2_is_n) {
+      return(c(name1, name2))
+    } else if (name1_is_n && !name2_is_n) {
+      return(c(name2, name1))
+    }
+
+    # Rule 3: When comparing 'H' and 'R', 'R' comes second
+    if (!name1_is_r && name2_is_r) {
+      return(c(name1, name2))
+    } else if (name1_is_r && !name2_is_r) {
+      return(c(name2, name1))
+    }
+    
+    return(c(name1, name2))
+  }
+
+  for(i in 1:(length(lev)-1)){
+    for(j in (i+1):length(lev)){
+      name_pair = compare_names(lev[[i]], lev[[j]])
+      if(length(name_pair) > 0){
+        nr = nr + 1
+        res_list[[nr]] = na.omit(results(x, contrast=c("group", name_pair[1], name_pair[2]), lfcThreshold = 0.1, alpha=0.05))
+        List_names[nr] = paste0(name_pair[1],"_vs_",name_pair[2])
+      }
+    } 
+  }
+  names(res_list) = List_names
+  return(res_list)
+}
+
+xray_res_list = group_comparisions()
+cion_res_list = group_comparisions(x = dds_c,y = levels(dds_c$group))
+total_res_list = group_comparisions(x = dds_t,y = levels(dds_t$group))
+# now we check for differential expressed genes
+xray_diff_expressed_genes = lapply(xray_res_list, function(x) x[x$padj < 0.05 & abs(x$log2FoldChange) > 1 ,] )
+xray_diff_expressed_genes = lapply(xray_diff_expressed_genes, function(x) x[order(x$log2FoldChange),] )
+xray_diff_expressed_genes_over = lapply(xray_diff_expressed_genes,function(x) x[x$log2FoldChange > 1 ,])
+xray_diff_expressed_genes_under = lapply(xray_diff_expressed_genes,function(x) x[x$log2FoldChange < 1 ,])
+
+cion_diff_expressed_genes = lapply(cion_res_list, function(x) x[x$padj < 0.05 & abs(x$log2FoldChange) > 1 ,] )
+cion_diff_expressed_genes = lapply(cion_diff_expressed_genes, function(x) x[order(x$log2FoldChange),] )
+cion_diff_expressed_genes_over =  lapply(cion_diff_expressed_genes, function(x) x[x$log2FoldChange > 1,] )
+cion_diff_expressed_genes_under =  lapply(cion_diff_expressed_genes, function(x) x[x$log2FoldChange < 1,] )
+
+total_diff_expressed_genes = lapply(total_res_list, function(x) x[x$padj < 0.05 & abs(x$log2FoldChange) > 1 ,] )
+total_diff_expressed_genes = lapply(total_diff_expressed_genes, function(x) x[order(x$log2FoldChange),] )
+total_diff_expressed_genes_over = lapply(total_diff_expressed_genes, function(x) x[x$log2FoldChange >1,] )
+total_diff_expressed_genes_under = lapply(total_diff_expressed_genes, function(x) x[x$log2FoldChange < 1,] )
+```
+
+```{r plots}
+rld = rlog(dds)
+rld2 = rld
+assay(rld2) <- limma::removeBatchEffect(assay(rld2), rld2$Batch)
+
+rld_c = rlog(dds_c)
+rld2_c = rld_c
+assay(rld2_c) <- limma::removeBatchEffect(assay(rld2_c), rld2_c$Batch)
+
+rld_t = rlog(dds_t)
+rld2_t = rld_t
+assay(rld2_t) <- limma::removeBatchEffect(assay(rld2_t), rld2_t$Batch)
+
+
+make_fancy_pca = function(x,int=c("group","Batch"),
+                          m="",sub = "",cap = "", leg = "right", s = 12){
+pcaData <- plotPCA(x, intgroup=int, returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=group.1, shape=Batch)) +
+ geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + 
+  scale_shape_manual(values=c(15, 16, 17, 18,8,9,10,11))+
+  theme(legend.position=leg, legend.box="horizontal", legend.margin=margin(),plot.margin = unit(c(0,0,0,0), "cm"), plot.title = element_text(size=s)) +
+  labs(title = m,
+              subtitle = sub,
+              caption = cap,
+              fill = "") 
+
+}
+make_dist_m = function(x,m){
+  
+sampleDists <- dist(t(assay(x)))
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(x$group, x$Batch, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+#png(filename = paste("Masterthesis/",m,"_rmout",".png"))
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors, main = m, treeheight_col = 0 )
+#dev.off()
+
+}
+pdf("dist_matrix&PCA_xray_2.pdf")
+make_dist_m(rld,m = "distance matrix x_ray")
+make_dist_m(rld2, m = "distance matrix x_ray batch corrected")
+make_fancy_pca(rld,m="PCA x_ray all samples" )
+make_fancy_pca(rld2,m="PCA x_ray all samples batch corrected" )
+dev.off()
+
+pdf("dist_matrix&PCA_cion_2.pdf")
+make_dist_m(rld_c,m="distance matrix c_ion")
+make_dist_m(rld2_c,m="distance matrix c_ion batch corrected")
+make_fancy_pca(rld_c,m="PCA c_ion all samples")
+make_fancy_pca(rld2_c,m ="PCA c_ion all samples batch corrected")
+dev.off()
+
+pdf("dist_matrix&PCA_total_2.pdf")
+make_dist_m(rld_t,m="distance matrix total")
+make_dist_m(rld2_t,m="distance matrix total batch corrected")
+make_fancy_pca(rld_t,m="PCA total all samples")
+make_fancy_pca(rld2_t,m ="PCA total all samples batch corrected")
+dev.off()
+```
+
+```{r}
+plot1 = make_fancy_pca(rld,m="x-ray ", leg = "none", s = 12 )
+plot2 = make_fancy_pca(rld2,m="x-ray batch corrected", leg = "none", s = 12 )
+
+Arrange_plots = function(plot1,plot2,pname = ""){
+p_no_legend <- list(plot1,plot2)
+legend <- cowplot::get_legend(p_no_legend[[1]] +labs(color = "")+ theme(legend.position = "bottom") )
+
+title <- cowplot::ggdraw() + cowplot::draw_label(pname, fontface = "bold")
+
+p_grid <- cowplot::plot_grid(plotlist = p_no_legend, ncol = 2, labels = "auto", label_size = 12) 
+cowplot::plot_grid(title, p_grid, legend, ncol = 1, rel_heights = c(0.1, 1, 0.2))
+}
+
+ggsave("Masterthesis/PCA_x_ray_rm_outliers.tiff",plot = Arrange_plots(plot1,plot2), device = "tiff",units = "in", width = 7, height = 5, dpi = 300)
+
+ggsave("Masterthesis/PCA_Cion_allsamples_rm_outliers.tiff",plot = Arrange_plots(
+  make_fancy_pca(rld_c,m="C-ion", leg = "none"),make_fancy_pca(rld2_c,m ="C-ion batch corrected",leg = "none")),
+       device = "tiff",units = "in", width = 7, height = 5, dpi = 300)
+
+plot1 = make_fancy_pca(rld_t,m="total", leg = "none")
+plot2 = make_fancy_pca(rld2_t,m ="total batch corrected", leg = "none")
+ggsave("Masterthesis/PCA_total_allsamples_rm_outliers.tiff",plot = Arrange_plots(plot1,plot2), device = "tiff",units = "in", width = 7, height = 5, dpi = 300)
+
+
+## now the dist matrixes
+plot1 = make_dist_m(rld,m = "distance matrix x_ray")
+plot2 = make_dist_m(rld2, m = "distance matrix x_ray \n batch corrected")
+
+make_dist_m(rld_c,m="distance matrix c_ion")
+make_dist_m(rld2_c,m="distance matrix c_ion batch corrected")
+
+make_dist_m(rld_t,m="distance matrix total")
+make_dist_m(rld2_t,m="distance matrix total batch corrected")
+
+make_dist_m(rld,m = "distance matrix x_ray")
+make_dist_m(rld2, m = "distance matrix x_ray batch corrected")
+
+Arrange_plots(plot1,plot2)
+```
+
+
+```{r}
+# now we take a look at the top 30 genes sorted after padj 
+#the first function does give us on overview for all samples and the second just compares 
+#the exact two of interest
+make_total_heatmap = function(l,x,d, m=""){
+for(i in 1:length(l)){
+if(nrow(l[[i]])==0){
+  print(names(l)[i])
+}
+  else if (nrow(l[[i]])< 30){
+    select <- rownames(l[[i]])[order(l[[i]]$padj,decreasing = FALSE)][1:nrow(l[[i]])] # sorting after padj
+
+    df <- as.data.frame(colData(d)[,c("group","Batch")]) # getting that dataframe for annotations 
+    pheatmap(assay(x)[select,], cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, main = paste(names(l)[i],m)) #printing the heatmap
+}
+  else{
+select <- rownames(l[[i]])[order(l[[i]]$padj,decreasing = FALSE)][1:30] # sorting after padj
+
+df <- as.data.frame(colData(d)[,c("group","Batch")]) # getting that dataframe for annotations 
+pheatmap(assay(x)[select,], cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, main = paste(names(l)[i],m)) #printing the heatmap
+}
+}
+}
+
+##INSTEAD OF .c I could also count up the batch structure with g sub 4 times remove .c first
+ad_c = function(col_select){
+index = 1
+for (entry in grepl("([a-zA-Z]).8Gy_c.4h.([0-9])", col_select)){
+  if (entry == TRUE){
+  col_select[index] = paste0(col_select[index],".c")
+  }
+  index = index+1
+}
+return(col_select)
+}
+
+make_total_heatmap(xray_res_list,rld,dds, m = "xray")
+make_total_heatmap(cion_res_list,rld_c,dds_c, m = "cion")
+make_total_heatmap(xray_diff_expressed_genes,rld,dds)
+make_total_heatmap(cion_diff_expressed_genes,rld_c,dds_c, m = "cion")
+
+make_ind_heatmap = function(l,x,d,m=""){
+spl = strsplit(names(l), "_vs_")
+for(i in 1:length(l)){
+  if(nrow(l[[i]])==0){
+  print(names(l)[i])
+  }
+  else if (nrow(l[[i]])< 30){
+    select <- rownames(l[[i]])[order(l[[i]]$padj,decreasing = FALSE)][1:nrow(l[[i]])]
+    col_select = c(paste0(gsub("([a-zA-Z])([0-9])","\\1.\\2",spl[[i]][1]),".4h.",1:8),paste0(gsub("([a-zA-Z])([0-9])","\\1.\\2",spl[[i]][2]),".4h.",1:8)) #okay to only show the exact groups i needed to get all the columns that belong to them the gsub pulls 
+    col_select = ad_c(col_select = col_select)
+    col_select = col_select[col_select %in% colnames(assay(x))]
+    df <- as.data.frame(colData(d)[,c("group","Batch")])
+    df = df[df$group == spl[[i]][1] | df$group == spl[[i]][2],]
+    pdf(paste("~/heatmaps/",names(l)[i],m,".pdf"))
+    pheatmap(assay(x)[select,][,col_select], cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, main = paste(names(l)[i],m),display_numbers = round(assay(x)[select,][,col_select],2))
+    dev.off()
+  }
+  else{
+select <- rownames(l[[i]])[order(l[[i]]$padj,decreasing = FALSE)][1:30]
+col_select = c(paste0(gsub("([a-zA-Z])([0-9])","\\1.\\2",spl[[i]][1]),".4h.",1:8),paste0(gsub("([a-zA-Z])([0-9])","\\1.\\2",spl[[i]][2]),".4h.",1:8)) #okay to only show the exact groups i needed to get all the columns that belong to them the gsub pulls 
+col_select = ad_c(col_select = col_select)
+col_select = col_select[col_select %in% colnames(assay(x))]
+df <- as.data.frame(colData(d)[,c("group","Batch")])
+df = df[df$group == spl[[i]][1] | df$group == spl[[i]][2],]
+pdf(paste("~/heatmaps/",names(l)[i],m,".pdf"))
+pheatmap(assay(x)[select,][,col_select], cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, main = paste(names(l)[i],m ),display_numbers = round(assay(x)[select,][,col_select],2))
+dev.off()
+}
+}
+}
+
+make_ind_heatmap(xray_diff_expressed_genes,rld,dds, m = "xray")
+make_ind_heatmap(xray_diff_expressed_genes,rld2,dds, m = "xray batch corrected")
+make_ind_heatmap(cion_diff_expressed_genes,rld_c,dds_c, m= "cion")
+make_ind_heatmap(cion_diff_expressed_genes,rld2_c,dds_c,m= "cion batch corrected")
+make_ind_heatmap(total_diff_expressed_genes,rld_t,dds_t,m = "total xray and cion")
+```
+
+```{r vendiagramms}
+
+
+
+only_good_comp_cion = cion_diff_expressed_genes
+
+
+only_good_comp_xray = xray_diff_expressed_genes
+
+
+for(i in 1:length(only_good_comp_cion)){
+  png(filename = paste0("C:/Users/Frederik/Desktop/Dokumente/ven/removed_outliers/", names(only_good_comp_xray)[i],".png"))
+compare = list(rownames(only_good_comp_cion[[i]]), rownames(only_good_comp_xray[[i]]))
+names(compare) = c(paste0(names(only_good_comp_cion)[i],"_cion"),names(only_good_comp_xray)[i])
+
+print(ggVennDiagram(compare))
+dev.off()
+}
+
+
+ensemble_to_symbol = function(DF,ensembleIDs){ #the column in the dataframe with the IDs must be called ID
+library(EnsDb.Hsapiens.v79)
+# 1. Convert from ensembl.gene to gene.symbol
+ensembl.genes <- ensembleIDs
+
+geneIDs1 <- ensembldb::select(EnsDb.Hsapiens.v79, keys= ensembl.genes, keytype = "GENEID", columns = c("SYMBOL","GENEID"))
+tmp_df = full_join(DF, geneIDs1, by= c("ID" = "GENEID" ))
+return(tmp_df)
+}
+
+
+
+get_groups_venn = function(x,y, n = c("cion","xray")){
+  require(dplyr)
+  x = as.data.frame(x)
+  y = as.data.frame(y)
+  ij = semi_join(x,y, by = "ID") %>% merge( y, by = "SYMBOL", suffixes = n)
+  ajx = anti_join(x,y, by = "ID")
+  ajy = anti_join(y,x, by = "ID")
+
+  t_list = list(ij,ajx,ajy)
+  names(t_list)= c("shared",paste("only in",n[1]),paste("only in",n[2]))
+
+  xego = x[x$log2FoldChange > 1 ,]
+  yego = y[y$log2FoldChange > 1 ,]
+
+  ij_over = semi_join(xego,yego, by = "ID") %>% merge( y, by = "SYMBOL", suffixes = n)
+  ajx_over = anti_join(xego,yego, by = "ID")
+  ajy_over = anti_join(yego,xego, by = "ID")
+
+  over_list = list(ij_over,ajx_over,ajy_over)
+  names(over_list) = c("shared",paste("only in",n[1]),paste("only in",n[2]))
+
+  xegu = x[x$log2FoldChange < -1 ,]
+  yegu = y[y$log2FoldChange < -1 ,]
+
+  ij_under = semi_join(xegu,yegu, by = "ID") %>% merge( y, by = "SYMBOL", suffixes = n)
+  ajx_under = anti_join(xegu,yegu, by = "ID")
+  ajy_under = anti_join(yegu,xegu, by = "ID")
+
+  under_list = list(ij_under,ajx_under,ajy_under)
+  names(under_list) = c("shared",paste("only in",n[1]),paste("only in",n[2]))
+
+  j_list = list(t_list,over_list,under_list)
+  names(j_list) = c("total","over","under")
+
+  return(j_list)
+}
+
+for (name in names(only_good_comp_cion)){
+for (i  in 1:3) {
+  for (j in 1:3){
+    write.csv(results_H0vsN0[[i]][[j]], file = paste0("ven/removed_outliers/",name,names(results_H0vsN0[i]),"_",names(results_H0vsN0[[i]])[j],".csv"))
+  }
+}
+}
+```
+
+```{r}
+
+
+
+# we can make this better by taking in informationform both so work through the select 
+# combine them first to a dataframe c and x then move on with the filtering and order 
+find_trend = function(group){
+select_test_x = rownames(xray_diff_expressed_genes[[group]][xray_diff_expressed_genes[[group]]$log2FoldChange > 1,])
+select_test_c = rownames(cion_diff_expressed_genes[[group]][cion_diff_expressed_genes[[group]]$log2FoldChange > 1,])
+
+select_test = unique(c(select_test_x, select_test_c))
+
+if (length(select_test)==0){print("not possible one is 0")}
+
+else{
+# Get the common row names in both xray_res_list and cion_res_list
+common_rows = intersect(rownames(xray_res_list[[group]]), rownames(cion_res_list[[group]]))
+
+# Subset the data frames by the common row names and the selected tests
+ax = xray_res_list[[group]][rownames(xray_res_list[[group]]) %in% intersect(select_test, common_rows),]
+ax$ID = row.names(ax)
+ax$ray = "x"
+ax = as.data.frame(ax)
+
+
+ac = cion_res_list[[group]][rownames(cion_res_list[[group]]) %in% intersect(select_test, common_rows),]
+ac$ID = row.names(ac)
+ac$ray = "c"
+ac = as.data.frame(ac)
+
+# Before creating visual12, order ax by log2FoldChange
+ax = ax[order(ax$log2FoldChange), ]
+
+# Create a new factor in ax and ac with levels ordered by the order in ax
+ax$ID = factor(ax$ID, levels = ax$ID)
+ac$ID = factor(ac$ID, levels = levels(ax$ID))
+visual12 = rbind(ax,ac)
+
+
+p1 <- ggplot(visual12, aes(x=fct_inorder(ID), y=log2FoldChange, group=ray, col=ray, fill=ray)) +
+      geom_point() +
+      geom_smooth() +
+        geom_hline(aes(linetype = "Zero Line"), yintercept = 0, color = "red") +
+      scale_linetype_manual(values = "solid", labels = "Zero Line") +
+  geom_hline(yintercept = 0.5, color = "green") +
+  theme(axis.text.x = element_blank(), plot.title = element_text(size = rel(2.5)),
+            axis.title.x = element_text(size = rel(2.2)),
+            axis.title.y = element_text(size = rel(2.2)),
+            legend.text = element_text(size = rel(2.2)), 
+            legend.title = element_text(size = rel(2.2)),
+        axis.text.y = element_text(size = rel(2.2)))
+############## the second graph starts here
+select_test_x = rownames(xray_diff_expressed_genes[[group]][xray_diff_expressed_genes[[group]]$log2FoldChange < -1,])
+select_test_c = rownames(cion_diff_expressed_genes[[group]][cion_diff_expressed_genes[[group]]$log2FoldChange < -1,])
+
+select_test = unique(c(select_test_x, select_test_c))
+
+# Get the common row names in both xray_res_list and cion_res_list
+common_rows = intersect(rownames(xray_res_list[[group]]), rownames(cion_res_list[[group]]))
+
+ax = xray_res_list[[group]][rownames(xray_res_list[[group]]) %in% intersect(select_test, common_rows),]
+ax$ID = row.names(ax)
+ax$ray = "x"
+ax = as.data.frame(ax)
+
+
+ac = cion_res_list[[group]][rownames(cion_res_list[[group]]) %in% intersect(select_test, common_rows),]
+ac$ID = row.names(ac)
+ac$ray = "c"
+ac = as.data.frame(ac)
+
+# Before creating visual12, order ax by log2FoldChange
+ax = ax[order(ax$log2FoldChange, decreasing = TRUE), ]
+
+# Create a new factor in ax and ac with levels ordered by the order in ax
+ax$ID = factor(ax$ID, levels = ax$ID)
+ac$ID = factor(ac$ID, levels = levels(ax$ID))
+visual12 = rbind(ax,ac)
+
+
+p2 <- ggplot(visual12, aes(x=fct_inorder(ID), y=log2FoldChange, group=ray, col=ray, fill=ray)) +
+      geom_point() +
+      geom_smooth()+
+        geom_hline(aes(linetype = "Zero Line"), yintercept = 0, color = "red") +
+      scale_linetype_manual(values = "solid", labels = "Zero Line") +
+  geom_hline(yintercept = -0.5, color = "green") +
+  theme(axis.text.x = element_blank(), plot.title = element_text(size = rel(2.5)),
+            axis.title.x = element_text(size = rel(2.2)),
+            axis.title.y = element_text(size = rel(2.2)),
+            legend.text = element_text(size = rel(2.2)), 
+            legend.title = element_text(size = rel(2.2)),
+        axis.text.y = element_text(size = rel(2.2)))
+# this is needed for H8 vs N8 becauseotherwise the graph has not enough space for the data then the 48 and and 360 for height and width need to be doubled. 
+
+ggsave( paste("Downregulated genes",group,"_trend.tiff"), plot = p2 + ggtitle(paste("Downregulated genes",group)) + xlab("genes"), dpi = 96, width = 960/96, height = 720/96,device = "tiff")
+
+ggsave( paste("Upregulated genes",group,"_trend.tiff"), plot = p1 + ggtitle(paste("Upregulated genes",group)) + xlab("genes"), dpi = 96, width = 960/96, height = 720/96,device = "tiff")
+
+print(p1 + ggtitle(paste("Upregulated genes",group)) + xlab("genes"))
+print(p2 + ggtitle(paste("Downregulated genes",group)) + xlab("genes"))
+}
+}
+
+group_names = names(cion_res_list)
+for( i in group_names){find_trend(group = i)}
+
+#find_trend("R0Gy_vs_N0Gy")
+```
+
+##GO Over representation analysis
+```{r GO Over representation analysis}
+ run_enrichGO_for_all = function(res_list,deg){
+   GO_list = list()
+ for(i in 1:length(res_list)){
+  GO_list[[i]] = enrichGO(gene = rownames(deg[[i]]),
+          universe = rownames(res_list[[i]]),
+          OrgDb = org.Hs.eg.db,
+          ont = "BP",
+          keyType = "ENSEMBL",
+          readable = F)
+ }
+   names(GO_list) = names(res_list)
+   return(GO_list)
+ }
+ go_res_total = run_enrichGO_for_all(total_res_list,total_diff_expressed_genes)
+ go_res_total_over = run_enrichGO_for_all(total_res_list,total_diff_expressed_genes_over)
+ go_res_total_under = run_enrichGO_for_all(total_res_list,total_diff_expressed_genes_under)
+ 
+ go_res_xray = run_enrichGO_for_all(xray_res_list,xray_diff_expressed_genes)
+ go_res_xray_over = run_enrichGO_for_all(xray_res_list,xray_diff_expressed_genes_over)
+ go_res_xray_under = run_enrichGO_for_all(xray_res_list,xray_diff_expressed_genes_under)
+ 
+ go_res_cion = run_enrichGO_for_all(cion_res_list,cion_diff_expressed_genes)
+ go_res_cion_over = run_enrichGO_for_all(cion_res_list,cion_diff_expressed_genes_over)
+ go_res_cion_under = run_enrichGO_for_all(cion_res_list,cion_diff_expressed_genes_under)
+```
+##GO gene set enrichment analysis
+```{r GO gene set enrichment analysis}
+padj_total_filtered_res_list = lapply(total_res_list, function(x) x[x$padj < 0.05,])
+padj_xray_filtered_res_list = lapply(xray_res_list, function(x) x[x$padj < 0.05,])
+padj_cion_filtered_res_list = lapply(cion_res_list, function(x) x[x$padj < 0.05,])
+
+
+run_gesa_for_all = function(res_list){
+gsea_list = list()  
+
+for (i in 1:length(res_list)) {
+  if(nrow(res_list[[i]]) != 0 ){
+ ## i forgot to add this which means we did also go through genes with padj bigger then 0.05
+ genelist1 = as.vector(res_list[[i]]$log2FoldChange)
+ names(genelist1) = rownames(res_list[[i]])
+ genelist1 = sort(genelist1,decreasing = T)
+ 
+  gsea = gseGO(geneList = genelist1,OrgDb = org.Hs.eg.db,
+          ont = "BP",
+          keyType = "ENSEMBL",
+          eps = 0)
+  
+  gsea_list[[i]] = gsea
+  }
+  else{
+    next
+  }
+}
+  names(gsea_list) = names(res_list)
+  return(gsea_list)
+}
+gsea_total = run_gesa_for_all(padj_total_filtered_res_list)
+gsea_total_wo_padj = run_gesa_for_all(total_res_list)
+gsea_cion = run_gesa_for_all(padj_cion_filtered_res_list)
+gsea_xray = run_gesa_for_all(padj_xray_filtered_res_list)
+
+row.names(total_res_list$H8Gy_vs_H0Gy)
+```
+##Visualize GO results
+```{r}
+visualize_go_res_list = function(go_res){
+  for (i in 1:length(go_res)){
+  if (length(go_res[[i]]$ID > 0)) {print(barplot(go_res[[i]], showCategory = 15, cex.names = 0.5, cex.axis = 0.5, main = names(go_res)[i]))}
+
+}
+}
+# Load required libraries
+library(clusterProfiler)
+library(ggplot2)
+library(RColorBrewer)
+
+# Custom barplot function
+custom_barplot <- function(go_data, title) {
+  bar_dat <- data.frame(Term = go_data$Description,
+                        Count = go_data$Count,
+                        P.adjust = go_data$p.adjust,
+                        stringsAsFactors = FALSE)
+  bar_dat <- head(bar_dat[order(-bar_dat$Count), ], 15)
+  
+  # Log transformation of p.adjust values
+  bar_dat$P.adjust.log <- -log10(bar_dat$P.adjust)
+  
+  # Define color gradient and map adjusted p-values to the gradient
+  color_gradient <- colorRampPalette(rev(brewer.pal(9, "Blues")))(100)
+  bar_dat$Color <- color_gradient[cut(bar_dat$P.adjust.log, breaks = seq(0, max(bar_dat$P.adjust.log), length.out = 101))]
+
+  # Create a ggplot
+  p <- ggplot(bar_dat, aes(x = reorder(Term, Count), y = Count, fill = P.adjust.log)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradientn(colors = color_gradient, name = "-log10(P.adjust)") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = title, x = "", y = "Count") +
+    theme(axis.text.y = element_text(size = 16),   # Adjust size of bar names
+          axis.text.x = element_text(size = 14),
+          axis.title.x = element_text(size = 16))   # Adjust size of bar heights
+  
+  return(p)
+}
+
+
+# Updated visualization function
+# Updated visualization function
+visualize_go_res_list = function(go_res,pa,cxt) {
+  for (i in 1:length(go_res)) {
+    if (length(go_res[[i]]$ID > 0)) {
+      p <- custom_barplot(go_res[[i]], title = paste0(names(go_res)[i],cxt ))
+      ggsave(paste0("GO_plot_", names(go_res)[i], ".png"), plot = p, width = 12, height = 8, path = pa )
+    }
+  }
+}
+
+
+
+
+
+visualize_gsea_res_list = function(gsea_res){
+  for (i in 1:length(gsea_res)){
+  if (length(gsea_res[[i]]$ID > 0)) {print(ridgeplot(gsea_res[[i]], showCategory = 15, label_format = 20)+labs(title = names(gsea_res)[i]))}
+}
+}
+
+visualize_go_res_list(go_res_total, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/total/complet",cxt = " total")
+visualize_go_res_list(go_res_total_over, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/total/over",cxt = " total over")
+visualize_go_res_list(go_res_total_under, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/total/under",cxt = " total under")
+
+visualize_go_res_list(go_res_xray, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/xray",cxt = " X-ray")
+visualize_go_res_list(go_res_xray_over, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/xray/over",cxt = " X-ray over")
+visualize_go_res_list(go_res_xray_under, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/xray/under",cxt = " X-ray under")
+
+visualize_go_res_list(go_res_cion, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/cion",cxt = " C-ion")
+visualize_go_res_list(go_res_cion_over, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/cion/over",cxt = " C-ion over")
+visualize_go_res_list(go_res_cion_under, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/cion/under",cxt = " C-ion under")
+
+
+
+
+
+visualize_gsea_res_list(gsea_xray)
+dotplot(gsea_xray$H0Gy_vs_H8Gy)
+as.data.frame(gsea_xray$H0Gy_vs_H8Gy)
+
+
+
+#pdf("H0Gy_vs_N0Gy_DLR.pdf")
+## working on a better way to make the graphs
+    p<-ggplot(data=as.data.frame(go_res_total$H0Gy_vs_N0Gy)[1:20,], aes(x=Count, y= fct_rev(fct_inorder(Description)),fill= p.adjust)) +
+      labs(title = "H0Gy_vs_N0Gy_total", y = "") +
+  geom_bar(stat="identity")
+p
+
+    p<-ggplot(data=as.data.frame(go_res_total_over$H0Gy_vs_N0Gy)[1:20,], aes(x=Count, y= fct_rev(fct_inorder(Description)),fill= p.adjust)) +
+      labs(title = "H0Gy_vs_N0Gy_total_over", y = "") +
+  geom_bar(stat="identity")
+p
+    p<-ggplot(data=as.data.frame(go_res_total_under$H0Gy_vs_N0Gy)[1:20,], aes(x=Count, y= fct_rev(fct_inorder(Description)),fill= p.adjust)) +
+      labs(title = "H0Gy_vs_N0Gy_total_under", y = "") +
+  geom_bar(stat="identity")
+p
+
+    p<-ggplot(data=as.data.frame(go_res_xray$H0Gy_vs_N0Gy)[1:20,], aes(x=Count, y= fct_rev(fct_inorder(Description)),fill= p.adjust)) +
+      labs(title = "H0Gy_vs_N0Gy_xray", y = "") +
+  geom_bar(stat="identity")
+p
+
+    p<-ggplot(data=as.data.frame(go_res_xray_over$H0Gy_vs_N0Gy)[1:20,], aes(x=Count, y= fct_rev(fct_inorder(Description)),fill= p.adjust)) +
+      labs(title = "H0Gy_vs_N0Gy_xray_over", y = "") +
+  geom_bar(stat="identity")
+p
+
+    p<-ggplot(data=as.data.frame(go_res_xray_under$H0Gy_vs_N0Gy)[1:20,], aes(x=Count, y= fct_rev(fct_inorder(Description)),fill= p.adjust)) +
+      labs(title = "H0Gy_vs_N0Gy_xray_under", y = "") +
+  geom_bar(stat="identity")
+p
+
+dev.off()
+```
+##Frequency of Go terms
+```{r}
+make_go_res_summary_table = function(go_res){
+go_res_no_0 = go_res %>% compact() # compact removes empty lists
+go_res_no_0 = go_res_no_0[rapply(go_res_no_0,nrow) > 0] #removes every empty dataframe
+names_ = names(go_res_no_0)
+
+df1 = as.data.frame(go_res_no_0[[1]])[1:15,c(1,2)]
+df1$padj = go_res_no_0[[1]][1:15,]$p.adjust
+
+for (i in 2:length(go_res_no_0)) {
+  df_tmp = as.data.frame(go_res_no_0[[i]])
+  #print(df_tmp)
+  if (nrow(df_tmp) < 15){df_tmp = df_tmp[1:nrow(df_tmp),c(1,2)]
+   df_tmp$padj = go_res_no_0[[i]][1:nrow(df_tmp),]$p.adjust
+  }
+  else {df_tmp = df_tmp[1:15,c(1,2)]
+   df_tmp$padj = go_res_no_0[[i]][1:15,]$p.adjust
+   }
+  
+ 
+  
+  df1 = full_join(df1,df_tmp, by =c("ID","Description"),copy = TRUE )
+}
+for (i in 1:length(go_res_no_0)) {
+  df1[,2+i] = as.data.frame(go_res_no_0[[i]])[df1$ID,]$p.adjust 
+}
+#print(df1)
+#df1[is.na(df1[,3:35]) == FALSE] <- 0
+df1[is.na(df1)] <- 0
+names(df1)[3:ncol(df1)] = names_
+
+df1$count <- rowSums(df1[,3:ncol(df1)]!=0)
+l = list()
+l2 = list()
+df2 = df1[,3:ncol(df1)]
+for(i in 1:nrow(df2)){
+  
+  for (j in 1:ncol(df2)) {
+    ent = df2[i,j]
+    if(ent != 0){l[[j]]= ent}
+  }
+  l2[[i]] = paste(compact(l))
+  l = list()
+}
+#df1$found_in = l2
+print(df1)
+return(df1)
+}
+
+
+
+summ_table_go_total = make_go_res_summary_table(go_res_total)
+summ_table_go_total_over = make_go_res_summary_table(go_res_total_over)
+summ_table_go_total_under = make_go_res_summary_table(go_res_total_under)
+
+summ_table_go_xray = make_go_res_summary_table(go_res_xray)
+summ_table_go_xray_over = make_go_res_summary_table(go_res_xray_over)
+summ_table_go_xray_under = make_go_res_summary_table(go_res_xray_under)
+
+summ_table_go_cion = make_go_res_summary_table(go_res_cion)
+summ_table_go_cion_over = make_go_res_summary_table(go_res_cion_over)
+summ_table_go_cion_under = make_go_res_summary_table(go_res_cion_under)
+
+summary_table_go_list = list(
+  summ_table_go_total,
+  summ_table_go_total_over,
+  summ_table_go_total_under,
+  
+  summ_table_go_xray,
+  summ_table_go_xray_over,
+  summ_table_go_xray_under,
+  
+  summ_table_go_cion,
+  summ_table_go_cion_over,
+  summ_table_go_cion_under) %>%
+
+  lapply(function(x) x[order(-x$count),])
+names(summary_table_go_list) = c(
+  "summ_table_go_total",
+  "summ_table_go_total_over",
+  "summ_table_go_total_under",
+  
+  "summ_table_go_xray",
+  "summ_table_go_xray_over",
+  "summ_table_go_xray_under",
+  
+  "summ_table_go_cion",
+  "summ_table_go_cion_over",
+  "summ_table_go_cion_under")
+
+Nonsensical_comparisions = c("H8Gy_vs_N0Gy","H8Gy_vs_R0Gy","N8Gy_vs_R0Gy","H0Gy_vs_N8Gy","H0Gy_vs_R8Gy",
+                             "N8Gy_c_vs_R8Gy","H8Gy_c_vs_N8Gy","H8Gy_c_vs_R8Gy","N8Gy_vs_R8Gy_c","H8Gy_vs_R8Gy_c","N0Gy_vs_R8Gy_c","H8Gy_vs_N8Gy_c","H8Gy_c_vs_N0Gy","H8Gy_c_vs_R0Gy","H0Gy_vs_N8Gy_c","N8Gy_c_vs_R0Gy","N0Gy_vs_R8Gy")
+
+test = summary_table_go_list$summ_table_go_total
+test$count = NULL
+test<- replace(test, test == 0, 1)
+test = test[,!colnames(test) %in% Nonsensical_comparisions]
+test = log(test[, 3:ncol(test)])
+test <- test[apply(test, 1, function(x) any(x != 0)), ]
+pheatmap(test)
+test
+
+melt(test)
+
+data1<-melt(test)
+ 
+ggplot(data1,aes(y = ID, x = variable, fill = value))+
+geom_tile()+scale_fill_gradient(high = "green", low = "white")
+
+make_summary_heatmap(summary_table_go_list,"go_heatmaps.pdf")
+
+```
+## visualize the go summary
+```{r}
+#pdf("go_summary.pdf")
+for (i in 1:length(summary_table_go_list)){
+  p = ggplot(data=summary_table_go_list[[i]][1:10,], aes(x=count, y=rev(fct_inorder(Description)))) +
+  geom_bar(stat="identity") + labs(title = names(summary_table_go_list)[i]  )
+  print(p)
+}
+#dev.off()
+```
+
+##gsea summary
+```{r}
+remove_list_element_by_name <- function(df) {
+  column_names <- names(df)
+  columns_to_remove <- grep("R", column_names)
+  cleaned_df <- df[ -columns_to_remove]
+  return(cleaned_df)
+}
+
+gsea_xray_nR = remove_list_element_by_name(gsea_xray)
+gsea_cion_nR = remove_list_element_by_name(gsea_cion)
+gsea_total_nR= remove_list_element_by_name(gsea_total)
+
+gsea_xray_nR_2 = gsea_total_nR[c("H8Gy_vs_H0Gy","H0Gy_vs_N0Gy","H8Gy_vs_N8Gy","N8Gy_vs_N0Gy")]
+gsea_cion_nR_2 = gsea_total_nR[c("H8Gy_c_vs_H0Gy", "H0Gy_vs_N0Gy", "H8Gy_c_vs_N8Gy", "N8Gy_c_vs_N0Gy")]
+gsea_summary_xray_nR_2 = make_go_res_summary_table(gsea_xray_nR_2)
+gsea_summary_cion_nR_2 = make_go_res_summary_table(gsea_cion_nR_2)
+
+
+gsea_summary_xray = make_go_res_summary_table(gsea_xray)
+gsea_summary_cion = make_go_res_summary_table(gsea_cion)
+gsea_summary_total= make_go_res_summary_table(gsea_total)
+
+
+
+gsea_summary_xray_nR = make_go_res_summary_table(gsea_xray_nR)
+gsea_summary_cion_nR = make_go_res_summary_table(gsea_cion_nR)
+gsea_summary_total_nR= make_go_res_summary_table(gsea_total_nR)
+
+summary_table_gsea_list_wo_R = list(
+gsea_summary_xray_nR,
+gsea_summary_cion_nR,
+gsea_summary_total_nR) %>%
+
+  lapply(function(x) x[order(-x$count),])
+
+names(summary_table_gsea_list_wo_R) = c(
+  "GSEA xray",
+  "GSEA cion",
+  "GSEA cion and xray"
+)
+
+
+summary_table_gsea_list = list(
+gsea_summary_xray,
+gsea_summary_cion,
+gsea_summary_total) %>%
+
+  lapply(function(x) x[order(-x$count),])
+
+names(summary_table_gsea_list) = c(
+  "gsea xray",
+  "gsea cion",
+  "gsea total"
+)
+
+summary_table_gsea_list_wo_R_2 = list(
+gsea_summary_xray_nR_2,
+gsea_summary_cion_nR_2) %>%
+
+  lapply(function(x) x[order(-x$count),])
+
+names(summary_table_gsea_list_wo_R_2) = c(
+  "GSEA xray merged experiments",
+  "GSEA cion merged experiments"
+)
+
+
+pdf("gsea_summary2.pdf")
+for (i in 1:length(summary_table_gsea_list)){
+  p = ggplot(data=summary_table_gsea_list[[i]][1:10,], aes(x=count, y=fct_inorder(Description))) +
+  geom_bar(stat="identity") + labs(title = names(summary_table_gsea_list)[i]  )
+  print(p)
+}
+dev.off()
+
+make_summary_graph = function(list){
+
+for(i in 1:length(list)) {
+  summ_df = list[[i]]
+summ_df$found_in = NULL
+summ_df$count = NULL
+summ_df$ID = NULL
+pheatmap(summ_df)
+summ_df = melt(summ_df,id.vars = "Description")
+summ_df$value =log2(summ_df$value)
+
+graph = ggplot(summ_df, aes(variable,Description)) +
+  geom_tile(aes(fill = value), colour = "white") +
+  scale_fill_gradient(low = "red", high = "white") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = names(list)[i])
+
+print(graph)
+
+}
+
+}
+
+
+
+make_summary_heatmap = function(list) {
+  
+  for(i in 1:length(list)){
+    row.names(list[[i]]) = list[[i]]$Description
+
+    color <- colorRampPalette(c("red","orange", "grey"))(255)
+    
+    summ_df = list[[i]]
+    summ_df$found_in = NULL
+    summ_df$count = NULL
+    summ_df$ID = NULL
+    summ_df$Description = NULL
+    summ_df[summ_df == 0] = 1
+    summ_df =log(summ_df)
+
+    HM_names = names(list)[i]
+    
+    # Create the 'full' heatmap and save it as a PNG file
+    png(filename=paste0("C:/Users/Frederik/Desktop/Dokumente/gesa_heatmaps/",HM_names,"wo_r_2.png"),width=3333, height = 4167, res = 300)
+    fontsize_row = 12 - nrow(summ_df) / 40
+    pheatmap(summ_df, main=paste(HM_names), cluster_cols=T, 
+             fontsize_row=fontsize_row, border_color=NA, fontsize_col = 12, angle_col = 90, color = color, treeheight_row = 0)
+    dev.off()
+    
+  }
+}
+
+make_summary_heatmap(summary_table_gsea_list_wo_R)
+make_summary_heatmap(summary_table_gsea_list) ##fix scaling
+
+make_summary_heatmap(summary_table_gsea_list_wo_R_2)
+
+Rerow_names = function(l){
+for(i in 1:3){
+row.names(l[[i]]) = l[[i]]$Description
+print(row.names(l[[i]]))
+}
+}
+Rerow_names(summary_table_gsea_list)
+
+row.names(summary_table_gsea_list[[2]])
+
+```
+
+##GO term symbols 
+```{r}
+make_go_res_summary_table = function(go_res){
+go_res_no_0 = go_res %>% compact() # compact removes empty lists
+#go_res_no_0 = go_res_no_0[sapply(go_res_no_0, is.data.frame)]
+
+go_res_no_0 = go_res_no_0[rapply(go_res_no_0,nrow) > 0] #removes every empty dataframe
+print(go_res_no_0)
+names_ = c("geneID_xray","xray","gene_ID_cion","cion")
+
+df1 = as.data.frame(go_res_no_0[[1]])
+if (nrow(df1) < 30) {
+  df1 = df1[1:nrow(df1),c(1,2,8)]
+  df1$padj = go_res_no_0[[1]][1:nrow(df1),]$p.adjust
+} else {
+  df1 = df1[1:30,c(1,2,8)]
+  df1$padj = go_res_no_0[[1]][1:30,]$p.adjust
+}
+#df1 = as.data.frame(go_res_no_0[[1]])[1:30,c(1,2,8)]
+#df1$padj = go_res_no_0[[1]][1:30,]$p.adjust
+
+for (i in 2:length(go_res_no_0)) {
+  df_tmp = as.data.frame(go_res_no_0[[i]])
+  #print(df_tmp)
+  if (nrow(df_tmp) < 30){df_tmp = df_tmp[1:nrow(df_tmp),c(1,2,8)]
+   df_tmp$padj = go_res_no_0[[i]][1:nrow(df_tmp),]$p.adjust
+  }
+  else {df_tmp = df_tmp[1:30,c(1,2,8)]
+   df_tmp$padj = go_res_no_0[[i]][1:30,]$p.adjust
+   }
+  
+ 
+  
+  df1 = full_join(df1,df_tmp, by =c("ID","Description"),copy = TRUE )
+}
+#print(df1)
+#df1[is.na(df1[,3:35]) == FALSE] <- 0
+df1[is.na(df1)] <- 0
+names(df1)[3:ncol(df1)] = names_
+
+df1$count <- rowSums(df1[,3:ncol(df1)]!=0)
+l = list()
+l2 = list()
+df2 = df1[,3:ncol(df1)]
+for(i in 1:nrow(df2)){
+  
+  for (j in 1:ncol(df2)) {
+    ent = df2[i,j]
+    if(ent != 0){l[[j]]= ent}
+  }
+  l2[[i]] = paste(compact(l))
+  l = list()
+}
+#df1$found_in = l2
+print(df1)
+return(df1)
+}
+
+library(EnsDb.Hsapiens.v79)
+for(i in 1:15){
+
+combined_res_HOvsN0 = list(go_res_xray[[i]], go_res_cion[[i]])
+names(combined_res_HOvsN0) = c("xray","cion")
+  # Skip this iteration if either data frame doesn't exist, is NULL, or has zero rows
+if (is.null(combined_res_HOvsN0[[1]])  | is.null(combined_res_HOvsN0[[2]])){
+  i = i + 1
+      next
+}
+
+combined_summ_table_H0_vs_N0 = make_go_res_summary_table(combined_res_HOvsN0)
+vector_A549_genes =  combined_summ_table_H0_vs_N0$geneID_xray %>% strsplit("/")
+vector_H358_genes =  combined_summ_table_H0_vs_N0$gene_ID_cion %>% strsplit("/")
+
+Ensemble_gene_vector_to_symbol_GO = function(x){
+j = 1
+safe_list = list()
+for(i in 1:length(x)){
+
+ensembl.genes <- x[[i]]
+
+geneIDs1 <- ensembldb::select(EnsDb.Hsapiens.v79, keys= ensembl.genes, keytype = "GENEID", columns = c("SYMBOL"))
+safe_list[[j]] = geneIDs1$SYMBOL
+j = j+1
+}
+return(safe_list)
+}
+combined_summ_table_H0_vs_N0$Symbol_xray = Ensemble_gene_vector_to_symbol_GO(vector_A549_genes)
+combined_summ_table_H0_vs_N0$Symbol_cion = Ensemble_gene_vector_to_symbol_GO(vector_H358_genes)
+
+
+
+combined_summ_table_H0_vs_N0$Symbol_cion = gsub("\"","",as.character(combined_summ_table_H0_vs_N0$Symbol_cion))
+combined_summ_table_H0_vs_N0$Symbol_xray = gsub("\"","",as.character(combined_summ_table_H0_vs_N0$Symbol_xray))
+
+combined_summ_table_H0_vs_N0$Symbol_cion[combined_summ_table_H0_vs_N0$Symbol_cion == "character(0)"] = "not found"
+combined_summ_table_H0_vs_N0$Symbol_xray[combined_summ_table_H0_vs_N0$Symbol_xray == "character(0)"] = "not found"
+combined_summ_table_H0_vs_N0$Symbol_cion = gsub("[c()]","",combined_summ_table_H0_vs_N0$Symbol_cion)
+combined_summ_table_H0_vs_N0$Symbol_xray = gsub("[c()]","",combined_summ_table_H0_vs_N0$Symbol_xray)
+
+
+
+write.csv(file = paste0("test_GO_tables/",names(go_res_cion)[i],".csv"),x = combined_summ_table_H0_vs_N0)
+}
+
+
+```
+## GO for the total
+```{r}
+make_go_res_summary_table = function(go_res){
+  go_res_no_0 = go_res %>% compact() # compact removes empty lists
+
+  go_res_no_0 = go_res_no_0[rapply(go_res_no_0,nrow) > 0] #removes every empty dataframe
+  
+  df1 = as.data.frame(go_res_no_0[[1]])
+  
+  if (nrow(df1) < 30) {
+    df1 = df1[1:nrow(df1),c(1,2,8)]
+    df1$padj = go_res_no_0[[1]][1:nrow(df1),]$p.adjust
+  } else {
+    df1 = df1[1:30,c(1,2,8)]
+    df1$padj = go_res_no_0[[1]][1:30,]$p.adjust
+  }
+
+  df1[is.na(df1)] <- 0
+  names(df1)[3:ncol(df1)] = "geneID"
+
+  df1$count <- rowSums(df1[,3:ncol(df1)]!=0)
+  
+  return(df1)
+}
+
+for(i in 1:15){
+
+  combined_res_H0vsN0 = list(go_res_total[[i]])
+  
+  # Skip this iteration if data frame doesn't exist, is NULL, or has zero rows
+  if (is.null(combined_res_H0vsN0[[1]])){
+    next
+  }
+
+  combined_summ_table_H0_vs_N0 = make_go_res_summary_table(combined_res_H0vsN0)
+  
+  vector_genes =  combined_summ_table_H0_vs_N0$geneID %>% strsplit("/")
+
+  Ensemble_gene_vector_to_symbol_GO = function(x){
+    j = 1
+    safe_list = list()
+    for(i in 1:length(x)){
+
+      ensembl.genes <- x[[i]]
+
+      geneIDs1 <- ensembldb::select(EnsDb.Hsapiens.v79, keys= ensembl.genes, keytype = "GENEID", columns = c("SYMBOL"))
+      safe_list[[j]] = geneIDs1$SYMBOL
+      j = j+1
+    }
+    return(safe_list)
+  }
+  
+  combined_summ_table_H0_vs_N0$Symbol = Ensemble_gene_vector_to_symbol_GO(vector_genes)
+
+  combined_summ_table_H0_vs_N0$Symbol = gsub("\"","",as.character(combined_summ_table_H0_vs_N0$Symbol))
+  combined_summ_table_H0_vs_N0$Symbol[combined_summ_table_H0_vs_N0$Symbol == "character(0)"] = "not found"
+  combined_summ_table_H0_vs_N0$Symbol = gsub("[c()]","",combined_summ_table_H0_vs_N0$Symbol)
+
+  write.csv(file = paste0("test_GO_tables/total/",names(go_res_total)[i],".csv"),x = combined_summ_table_H0_vs_N0)
+}
+```
+
+```{r}
+
+
+res_h8xvc = na.omit(results(dds_t, contrast=c("group", "H8Gy_c", "H8Gy"), lfcThreshold = 0.1))
+res_h8xcv_filter = res_h8xvc[res_h8xvc$padj < 0.05,]
+
+res_n8xvc = na.omit(results(dds_t, contrast=c("group", "N8Gy_c", "N8Gy"), lfcThreshold = 0.1))
+res_n8xcv_filter = res_n8xvc[res_n8xvc$padj < 0.05,]
+
+xvc_list = list(res_h8xvc,res_n8xvc)
+xvc_diff_genes = list(res_h8xcv_filter,res_n8xcv_filter)
+go_res_xvc = run_enrichGO_for_all(xvc_list,xvc_diff_genes)
+names(go_res_xvc) = c("H8_cion vs H8_xray","N8_cion vs N8_xray")
+
+visualize_go_res_list(go_res_xvc, pa = "C:/Users/Frederik/Desktop/Dokumente/go_res/total",cxt = "total")
+
+# Assuming you have two vectors of GO terms
+go_terms1 <- as.data.frame(go_res_xvc$`H8_cion vs H8_xray`)
+go_terms2 <- as.data.frame(go_res_xvc$`N8_cion vs N8_xray`)
+
+# Load the org.Hs.eg.db package (or whichever organism database you're using)
+# and GOSemSim
+library(org.Hs.eg.db)
+library(GOSemSim)
+
+# Prepare the godata object
+godata <- godata('org.Hs.eg.db', ont="BP")
+
+similarity_matrix <- matrix(nrow=length(go_terms1$ID), ncol=length(go_terms2$ID))
+
+# Fill in the matrix with semantic similarity scores
+for(i in seq_along(go_terms1)) {
+  for(j in seq_along(go_terms2)) {
+    similarity_matrix[i, j] <- mgoSim(go_terms1$ID[i], go_terms2$ID[j], semData=godata, measure="Wang")
+  }
+}
+
+# Assign row and column names to the matrix
+rownames(similarity_matrix) <- go_terms1$ID
+colnames(similarity_matrix) <- go_terms2$ID
+# Here, similarity_matrix is a matrix where entry [i, j] is the semantic
+# similarity between go_terms1[i] and go_terms2[j]. You can analyze this
+# matrix to determine which GO terms from the two lists are similar.
+
+library(GO.db)
+
+library(org.Hs.eg.db)
+
+# List of GO terms
+go_terms <- row.names(similarity_matrix)
+
+# Get the GO-to-gene mappings
+go_to_genes <- as.list(org.Hs.egGO2ALLEGS)
+
+# Check if the GO terms exist (i.e., they have at least one gene annotated)
+go_terms_exist <- sapply(go_terms, function(go_term) {
+  go_term %in% names(go_to_genes)
+})
+
+names(go_terms_exist) <- go_terms
+print(go_terms_exist)
+
+# Check how many genes each GO term has
+go_terms_genes <- sapply(go_terms, function(go_term) {
+  if(go_term %in% names(go_to_genes)) {
+    length(go_to_genes[[go_term]])
+  } else {
+    NA
+  }
+})
+
+names(go_terms_genes) <- go_terms
+print(go_terms_genes)
+###################################################
+
+# Load necessary libraries
+library(AnnotationHub)
+library(AnnotationDbi)
+
+# Create an AnnotationHub resource
+ah <- AnnotationHub()
+
+# Query for org.Hs.eg.db
+org.Hs.eg.dbs <- query(ah, c("org.Hs.eg.db"))
+org.Hs.eg.db <- org.Hs.eg.dbs[[1]]
+
+
+# Function to get genes for a single GO term
+get_genes_for_go <- function(go_term) {
+  # Get the gene IDs for the GO term
+  gene_ids <- as.character(org.Hs.eg.db[[go_term]])
+
+  # Convert the gene IDs to Ensembl gene IDs
+  ensembl_ids <- mapIds(org.Hs.eg.db, 
+                        keys = gene_ids, 
+                        column = "ENSEMBL", 
+                        keytype = "ENTREZID", 
+                        multiVals = "first")
+
+  return(ensembl_ids)
+}
+
+# Get Ensembl gene IDs for each GO term
+ensembl_ids_per_go <- lapply(go_terms, get_genes_for_go)
+
+# Print the Ensembl gene IDs for each GO term
+print(ensembl_ids_per_go)
+
+
+```
+##testing out how the trend is affected if both data sets are pulled from total 
+```{r}
+find_trend = function(group1,group2){
+select_test_x = rownames(total_diff_expressed_genes[[group1]][total_diff_expressed_genes[[group1]]$log2FoldChange > 1,])
+select_test_c = rownames(total_diff_expressed_genes[[group2]][total_diff_expressed_genes[[group2]]$log2FoldChange > 1,])
+
+select_test = unique(c(select_test_x, select_test_c))
+
+if (length(select_test)==0){print("not possible one is 0")}
+
+else{
+# Get the common row names in both xray_res_list and cion_res_list
+common_rows = intersect(rownames(total_res_list[[group1]]), rownames(total_res_list[[group2]]))
+
+# Subset the data frames by the common row names and the selected tests
+ax = total_res_list[[group1]][rownames(total_res_list[[group1]]) %in% intersect(select_test, common_rows),]
+ax$ID = row.names(ax)
+ax$ray = "x"
+ax = as.data.frame(ax)
+
+
+ac = total_res_list[[group2]][rownames(total_res_list[[group2]]) %in% intersect(select_test, common_rows),]
+ac$ID = row.names(ac)
+ac$ray = "c"
+ac = as.data.frame(ac)
+
+# Before creating visual12, order ax by log2FoldChange
+ax = ax[order(ax$log2FoldChange), ]
+
+# Create a new factor in ax and ac with levels ordered by the order in ax
+ax$ID = factor(ax$ID, levels = ax$ID)
+ac$ID = factor(ac$ID, levels = levels(ax$ID))
+visual12 = rbind(ax,ac)
+
+
+p1 <- ggplot(visual12, aes(x=fct_inorder(ID), y=log2FoldChange, group=ray, col=ray, fill=ray)) +
+      geom_point() +
+      geom_smooth() +
+        geom_hline(aes(linetype = "Zero Line"), yintercept = 0, color = "red") +
+      scale_linetype_manual(values = "solid", labels = "Zero Line") +
+  geom_hline(yintercept = 0.5, color = "green") +
+  theme(axis.text.x = element_blank(), plot.title = element_text(size = rel(2.5)),
+            axis.title.x = element_text(size = rel(2.2)),
+            axis.title.y = element_text(size = rel(2.2)),
+            legend.text = element_text(size = rel(2.2)), 
+            legend.title = element_text(size = rel(2.2)),
+        axis.text.y = element_text(size = rel(2.2)))
+############## the second graph starts here
+select_test_x = rownames(total_diff_expressed_genes[[group1]][total_diff_expressed_genes[[group1]]$log2FoldChange < -1,])
+select_test_c = rownames(total_diff_expressed_genes[[group2]][total_diff_expressed_genes[[group2]]$log2FoldChange < -1,])
+
+select_test = unique(c(select_test_x, select_test_c))
+
+# Get the common row names in both xray_res_list and cion_res_list
+common_rows = intersect(rownames(total_res_list[[group1]]), rownames(total_res_list[[group2]]))
+
+ax = total_res_list[[group1]][rownames(total_res_list[[group1]]) %in% intersect(select_test, common_rows),]
+ax$ID = row.names(ax)
+ax$ray = "x"
+ax = as.data.frame(ax)
+
+
+ac = total_res_list[[group2]][rownames(total_res_list[[group2]]) %in% intersect(select_test, common_rows),]
+ac$ID = row.names(ac)
+ac$ray = "c"
+ac = as.data.frame(ac)
+
+# Before creating visual12, order ax by log2FoldChange
+ax = ax[order(ax$log2FoldChange, decreasing = TRUE), ]
+
+# Create a new factor in ax and ac with levels ordered by the order in ax
+ax$ID = factor(ax$ID, levels = ax$ID)
+ac$ID = factor(ac$ID, levels = levels(ax$ID))
+visual12 = rbind(ax,ac)
+
+
+p2 <- ggplot(visual12, aes(x=fct_inorder(ID), y=log2FoldChange, group=ray, col=ray, fill=ray)) +
+      geom_point() +
+      geom_smooth()+
+        geom_hline(aes(linetype = "Zero Line"), yintercept = 0, color = "red") +
+      scale_linetype_manual(values = "solid", labels = "Zero Line") +
+  geom_hline(yintercept = -0.5, color = "green") +
+  theme(axis.text.x = element_blank(), plot.title = element_text(size = rel(2.5)),
+            axis.title.x = element_text(size = rel(2.2)),
+            axis.title.y = element_text(size = rel(2.2)),
+            legend.text = element_text(size = rel(2.2)), 
+            legend.title = element_text(size = rel(2.2)),
+        axis.text.y = element_text(size = rel(2.2)))
+# this is needed for H8 vs N8 becauseotherwise the graph has not enough space for the data then the 48 and and 360 for height and width need to be doubled. 
+
+#ggsave( paste("Downregulated genes",group,"_trend.tiff"), plot = p2 + ggtitle(paste("Downregulated genes",group)) + xlab("genes"), dpi = 96, width = 960/96, height = 720/96,device = "tiff")
+
+#ggsave( paste("Upregulated genes",group,"_trend.tiff"), plot = p1 + ggtitle(paste("Upregulated genes",group)) + xlab("genes"), dpi = 96, width = 960/96, height = 720/96,device = "tiff")
+
+print(p1 + ggtitle(paste("Upregulated genes",group1)) + xlab("genes"))
+print(p2 + ggtitle(paste("Downregulated genes",group1)) + xlab("genes"))
+}
+}
+
+find_trend("H8Gy_vs_N8Gy","H8Gy_c_vs_N8Gy_c")
+
+```
+
+```{r}
+group_differences = function(g1,g2,pcut = 0.05,fccut = 0.5){
+
+genset1 = as.data.frame(g1)  #xray first so that we get the results in a way that they are shown from the perspektive from the second group. 
+genset2 = as.data.frame(g2)
+genset1$ID = rownames(genset1)
+genset2$ID = rownames(genset2)
+
+
+fj_df = full_join(genset1,genset2,by = "ID") %>% dplyr::filter(padj.y <= pcut | padj.x <= pcut )
+fj_df[is.na(fj_df)] <- 0
+fj_df$comparedLog2fc =  fj_df$log2FoldChange.y - fj_df$log2FoldChange.x 
+fj_df = ensemble_to_symbol(fj_df,fj_df$ID) %>% dplyr::filter(abs(comparedLog2fc) >= fccut)
+sorted_dataframe <- fj_df[order(fj_df$comparedLog2fc), ]
+
+return(sorted_dataframe)
+}
+combine_gene_uv = function(df1,df2){rbind(df1, df2)[!duplicated(fromLast = FALSE, rownames(rbind(df1, df2))),]}
+  
+res_comp = list(combine_gene_uv(total_res_list$N8Gy_vs_N0Gy, total_res_list$H8Gy_vs_H0Gy),combine_gene_uv(total_res_list$N8Gy_vs_N0Gy, total_res_list$N8Gy_c_vs_N0Gy),combine_gene_uv(total_res_list$H8Gy_vs_H0Gy, total_res_list$H8Gy_c_vs_H0Gy),combine_gene_uv(total_res_list$N8Gy_c_vs_N0Gy, total_res_list$H8Gy_c_vs_H0Gy))
+names(res_comp) = c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0")
+
+comp_list =  list(
+## group_differences always compares the 2 givin groups in a way that the first is used as a norm and it calculates the deviation from that norm in compared_Log2fc
+group_differences(total_res_list$N8Gy_vs_N0Gy, total_res_list$H8Gy_vs_H0Gy),#Effect of the interaction of hypoxia and xray. 
+group_differences(total_res_list$N8Gy_vs_N0Gy, total_res_list$N8Gy_c_vs_N0Gy),#Direct differences of carbon ions and xrays under normoxia
+group_differences(total_res_list$H8Gy_vs_H0Gy, total_res_list$H8Gy_c_vs_H0Gy),#Direct differences of carbon ions and xrays under hypoxia
+group_differences(total_res_list$N8Gy_c_vs_N0Gy, total_res_list$H8Gy_c_vs_H0Gy)#Effect of the interaction of hypoxia and cion
+)
+names(comp_list) = c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0")
+
+for (i in seq_along(comp_list)){
+  write.csv(comp_list[[i]],paste0("C:/Users/Frederik/Desktop/Dokumente/filtered_genese_copmapred_conditions/",names(comp_list)[i],".csv"))
+}
+
+semi_join(comp_list$H8cH0_vs_H8H0,comp_list$H8cH0_vs_N8cN0,by = "SYMBOL")
+unlist(comp_list$H8cH0_vs_H8H0$symbol.y)
+```
+
+````{r}
+
+go_diff = function(df1,df2,n){#n for names a vector with 2 names of the dataframes.
+df1 <- data.frame(df1)
+
+df2 <- data.frame(df2)
+
+aj1 = anti_join(df1,df2, by = "ID") 
+aj2 = anti_join(df2,df1,by = "ID")
+test2 = rbind(aj1,aj2)
+test2$fromx = c(rep(n[2],times=nrow(aj1)),rep(n[1],times=nrow(aj2)))# i made a mistake while tiping in the names they are in the wron order so i switch them here. this means the anmes must be be invers to the dataframes just like in the text below
+df_aj  = test2[test2$fromx == n[1], ]
+df_aj2 =   test2[test2$fromx == n[2], ]
+res = list(df_aj,df_aj2)
+names(res) = n
+return(res)
+}
+##
+go_diff_list = list( go_diff(go_res_total$N8Gy_vs_N0Gy, go_res_total$H8Gy_vs_H0Gy, n = c("H8H0_1","N8N0_1")),#Effect of the interaction of hypoxia and xray. 
+go_diff(go_res_total$N8Gy_vs_N0Gy, go_res_total$N8Gy_c_vs_N0Gy, n = c("N8cN0_1","N8N0_2")),#Direct differences of carbon ions and xrays under normoxia
+go_diff(go_res_total$H8Gy_vs_H0Gy, go_res_total$H8Gy_c_vs_H0Gy, n = c("H8cH0_1","H8H0_2")),#Direct differences of carbon ions and xrays under hypoxia
+go_diff(go_res_total$N8Gy_c_vs_N0Gy, go_res_total$H8Gy_c_vs_H0Gy, n = c("H8cH0_2","N8cN0_2")))
+names(go_diff_list) = c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0")
+
+go_diff_list
+go_diff_list = flatten(go_diff_list)
+names(go_diff_list)
+
+
+get("GO:0048477", GOBPOFFSPRING)
+#check if there are any non BP ontologies
+deviation = c()
+for (i in 1:length(go_diff_list)) {
+result = apply(as.data.frame(go_diff_list[[i]]$ID),MARGIN = 1, FUN =  Ontology)
+deviation[i] = any(result != result[1])  
+}
+
+
+# this gives me a list of all child off shoots i wanna keep the ones that have the least amount 9of children that are unique in their set
+creat_offspring_list = function(gdl, name=c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0") ){
+offspring_list = list()
+for (i in 1:length(gdl)) {
+ offspring_list[[i]] = apply(as.data.frame(gdl[[i]]$ID),MARGIN = 1, FUN =function(x)  get(x,GOBPOFFSPRING))
+ names(offspring_list[[i]]) = gdl[[i]]$ID
+}
+
+
+sorted_offspring_list = list()
+for (i in 1:length(gdl)) {
+# Get the order of the list elements based on sublist length
+order_vec <- order(lengths(offspring_list[[i]]),decreasing = F)
+
+# Sort the list based on the order vector
+sorted_offspring_list[[i]] <- offspring_list[[i]][order_vec]
+
+}
+names(sorted_offspring_list) = name
+return(sorted_offspring_list)
+}
+
+sorted_offspring_list = creat_offspring_list(go_diff_list, name = names(go_diff_list))
+
+###################
+
+
+
+name_filter = function(my_list){#needs a sorted offspring list
+# Initialize the target index as 1
+target_index <- 1
+
+# Iterate through the elements of the list
+while (target_index <= length(my_list)) {
+  # Extract the target element based on the current index
+  target <- names(my_list)[target_index]
+  
+  # Remove the sublist if the target element appears in it
+  my_list <- my_list[!sapply(my_list, function(x) target %in% x)]
+  
+  # Increment the target index
+  target_index <- target_index + 1
+}
+return(my_list)
+}
+
+################################################################
+
+
+
+sublist_filter = function(my_list){
+# Initialize the target index as 1
+target_index <- 1
+# Iterate through the elements of the list
+while (target_index < length(my_list)) {
+  # Extract the target element based on the current index
+  my_list2 = my_list[-target_index]
+  for (i in 1:length(my_list[[target_index]])) {
+ #this is here to check if the list gets smaller then the index
+        if ( length(my_list)< target_index){
+        break
+        }
+  target <- my_list[[target_index]][i]
+
+  # Remove the sublist if the target element appears in it
+ #my_list <- my_list[!sapply(my_list, function(x) target %in% x)]
+    for (j in seq_along(my_list2)) {
+    # Get the current sublist
+
+    sublist <- my_list2[[j]]
+    
+    # Check if the target element appears in the sublist
+    if (!is.na(sublist) && target %in% sublist) {
+      # Remove the sublist if the target element is present
+      j = j+1
+      my_list <- my_list[-j]
+
+      }
+    }
+  }
+  target_index <- target_index + 1
+
+}
+return(my_list)
+}
+sorted_offspring_list
+
+name_filter(sorted_offspring_list)
+
+sublist_filter(sorted_offspring_list)
+comb_filter(sorted_offspring_list$H8H0_1, go_diff_list$H8H0_1)
+comb_filter(sorted_offspring_list$N8N0_1, go_diff_list$N8N0_1)
+
+comb_filter = function(my_list,gdl){
+  a = sublist_filter(my_list)
+  b = name_filter(my_list)
+  a = gdl[gdl$ID %in% names(a),]
+  b = gdl[gdl$ID %in% names(b),]
+  setdiff(a$ID,b$ID)
+  c= a[!a$ID %in% setdiff(a$ID,b$ID), ]
+  comb = list(a,b,c)
+  names(comb) = c("sublist_filtered","name_filtered","consense")
+  return(comb)
+}
+sorted_offspring_list$H8H0_2
+
+comb_filter_go = list(
+comb_filter(sorted_offspring_list$H8H0_vs_N8N0,go_diff_list$H8H0_vs_N8N0),
+comb_filter(sorted_offspring_list$N8cN0_vs_N8N0 ,go_diff_list$N8cN0_vs_N8N0 ),
+comb_filter(sorted_offspring_list$H8cH0_vs_H8H0 ,go_diff_list$H8cH0_vs_H8H0 ) ,
+comb_filter(sorted_offspring_list$H8cH0_vs_N8cN0,go_diff_list$H8cH0_vs_N8cN0)
+)
+names(comb_filter_go)= c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0")
+
+for (i in seq_along(comb_filter_go)){
+  write.csv(comb_filter_go[[i]][[3]],paste0("C:/Users/Frederik/Desktop/Dokumente/filtered_go_res/",names(comb_filter_go)[i],"_",names(comb_filter_go[[i]])[3],".csv"))
+  write.csv(comb_filter_go[[i]][[2]],paste0("C:/Users/Frederik/Desktop/Dokumente/filtered_go_res/",names(comb_filter_go)[i],"_",names(comb_filter_go[[i]])[2],".csv"))
+  write.csv(comb_filter_go[[i]][[1]],paste0("C:/Users/Frederik/Desktop/Dokumente/filtered_go_res/",names(comb_filter_go)[i],"_",names(comb_filter_go[[i]])[1],".csv"))
+}
+
+direct_go_Diff_list = list(as.data.frame(go_res_total$H8Gy_vs_N8Gy),as.data.frame(go_res_total$H8Gy_c_vs_N8Gy_c),as.data.frame(go_res_total$H8Gy_vs_H8Gy_c))  
+direct_comp = creat_offspring_list(direct_go_Diff_list, name = c("HvNx","HvNc","HxvHc")) 
+
+comb_filter(direct_comp$HvNx,go_res_total$H8Gy_vs_N8Gy)
+comb_filter(direct_comp$HvNc,go_res_total$H8Gy_c_vs_N8Gy_c)
+comb_filter(direct_comp$HcvHx,go_res_total$H8Gy_vs_H8Gy_c)
+
+gd = go_diff(go_res_total$H8Gy_vs_N8Gy,go_res_total$H8Gy_c_vs_N8Gy_c,c("HvNx","HvNc"))
+ol = creat_offspring_list(list(gd), name = c("HvNx_vs_HvNc"))
+comb_filter(ol$HvNx_vs_HvNc,gd)
+
+write_res_list_with_GID(total_res_list,"C:/Users/Frederik/Desktop/Dokumente/Gene_expression/")
+write_res_list_with_GID = function(df_list,p){
+  for(i in seq_along(df_list)){
+  name = names(df_list)  
+  df = df_list[[i]]  
+  df = as.data.frame(df)
+  df$ID = rownames(df)
+  df = ensemble_to_symbol(df,df$ID)
+  write.csv(df,file=paste0(p,name[i],".csv"))
+  
+  }
+}
+###################### we do the same with the gsea results
+gsea_diff_list = list( go_diff(gsea_total$N8Gy_vs_N0Gy, gsea_total$H8Gy_vs_H0Gy, n = c("H8H0_1","N8N0_1")),#Effect of the interaction of hypoxia and xray. 
+go_diff(gsea_total$N8Gy_vs_N0Gy, gsea_total$N8Gy_c_vs_N0Gy, n = c("N8cN0_1","N8N0_2")),#Direct differences of carbon ions and xrays under normoxia
+go_diff(gsea_total$H8Gy_vs_H0Gy, gsea_total$H8Gy_c_vs_H0Gy, n = c("H8cH0_1","H8H0_2")),#Direct differences of carbon ions and xrays under hypoxia
+go_diff(gsea_total$N8Gy_c_vs_N0Gy, gsea_total$H8Gy_c_vs_H0Gy, n = c("H8cH0_2","N8cN0_2")))
+names(gsea_diff_list) = c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0")
+
+gsea_diff_list = flatten(gsea_diff_list)
+
+
+gsea_offspring = creat_offspring_list(gsea_diff_list, name = names(gsea_diff_list))
+
+gsea_comb_res = list()
+for ( i in names(gsea_diff_list)){
+gsea_comb_res[[i]] = comb_filter(gsea_offspring[[i]],gsea_diff_list[[i]])
+
+}
+names(gsea_comb_res)= names(gsea_diff_list)
+
+
+#recombine the dataframes we did all of this so we dont kick entries from one group with the ones of another
+combined_consense_gsea = list(
+rbind(gsea_comb_res$H8H0_1$consense,gsea_comb_res$N8N0_1$consense),
+rbind(gsea_comb_res$N8cN0_1$consense,gsea_comb_res$N8N0_2$consense),
+rbind(gsea_comb_res$H8cH0_1$consense,gsea_comb_res$H8H0_2$consense),
+rbind(gsea_comb_res$H8cH0_2$consense,gsea_comb_res$N8cN0_2$consense)
+)
+names(combined_consense_gsea) = c("H8H0_vs_N8N0","N8cN0_vs_N8N0","H8cH0_vs_H8H0","H8cH0_vs_N8cN0")
+
+combined_consense_gsea
+
+#the naming stays the same
+for (i in seq_along(gsea_comb_res)){
+  #write.csv(gsea_comb_res[[i]][[3]],paste0("C:/Users/Frederik/Desktop/Dokumente/gsea_com_filter_results/",names(comb_filter_go)[i],"_top",names(comb_filter_go[[i]])[3],".csv"))
+  write.csv(gsea_comb_res[[i]][[2]],paste0("C:/Users/Frederik/Desktop/Dokumente/gsea_correct/",names(comb_filter_go)[i],"_top",names(comb_filter_go[[i]])[2],".csv"))
+ # write.csv(gsea_comb_res[[i]][[1]],paste0("C:/Users/Frederik/Desktop/Dokumente/gsea_com_filter_results/",names(comb_filter_go)[i],"_top",names(comb_filter_go[[i]])[1],".csv"))
+}
+gsea_comb_res[[1]][[2]]
+
+for(i in seq_along(combined_consense_gsea))
+combined_consense_gsea$H8H0_vs_N8N0
+gsea_comb_res$H8H0_1$name_filtered
+````
+
+```{r}
+
+```
+
+````{r}
+find_duplicates <- function(lists) {
+  # Überprüfen, ob es weniger als zwei Listen gibt
+  if (length(lists) < 2) {
+    cat("Es gibt nicht genügend Listen, um Duplikate zu finden.\n")
+    return(NULL)
+  }
+  
+  # Initialisierung einer leeren Liste für die Ergebnisse
+  results <- list()
+  
+  # Durchlaufen der Listen
+  for (i in 1:length(lists)) {
+    current_list <- lists[[i]]
+    shared_lists <- c()
+    shared_genes <- list()
+    
+    # Überprüfen auf Duplikate
+    for (j in 1:length(lists)) {
+      if (i == j)
+        next
+      
+      compared_list <- lists[[j]]
+      
+      # Finden der gemeinsamen Einträge zwischen den Listen
+      common_entries <- intersect(current_list, compared_list)
+      
+      # Überprüfen, ob gemeinsame Einträge vorhanden sind
+      if (length(common_entries) > 0) {
+        shared_lists <- c(shared_lists, j)
+        shared_genes[[as.character(j)]] <- common_entries
+      }
+    }
+    
+    # Speichern der gemeinsam geteilten Listen und Gene für den aktuellen Eintrag
+    entry <- list(
+      "Listen" = shared_lists,
+      "Gene" = shared_genes
+    )
+    results[[i]] <- entry
+  }
+  
+  # Konvertieren der Ergebnisse in einen DataFrame
+  df <- data.frame(
+    Listen = sapply(results, function(x) paste(x$Listen, collapse = ",")),
+    Gene = sapply(results, function(x) paste(unlist(x$Gene), collapse = ","))
+  )
+  
+  # Rückgabe des DataFrames
+  return(df)
+}
+
+
+
+
+make_tld_list <- function(lists) {
+  # Überprüfen, ob es weniger als zwei Listen gibt
+  if (length(lists) < 2) {
+    cat("Es gibt nicht genügend Listen, um Duplikate zu finden.\n")
+    return(NULL)
+  }
+
+  # Initialisierung einer leeren Liste für die Ergebnisse
+  results <- list()
+
+  # Durchlaufen der Listen
+  for (i in 1:length(lists)) {
+    current_list <- lists[[i]]
+    shared_lists <- c()
+    shared_genes <- list()
+
+    # Überprüfen auf Duplikate
+    for (j in 1:length(lists)) {
+      compared_list <- lists[[j]]
+
+      # Finden der gemeinsamen Einträge zwischen den Listen
+      common_entries <- intersect(current_list, compared_list)
+
+      # Überprüfen, ob gemeinsame Einträge vorhanden sind
+      if (length(common_entries) > 0) {
+        shared_lists <- c(shared_lists, j)
+        shared_genes[[as.character(j)]] <- common_entries
+      }
+    }
+
+    # Speichern der gemeinsam geteilten Listen und Gene für den aktuellen Eintrag
+    entry <- list(
+      "Listen" = shared_lists,
+      "Gene" = shared_genes
+    )
+    results[[i]] <- entry
+  }
+
+  return(results)
+}
+library(EnsDb.Hsapiens.v79)
+
+
+tld_list <- list()
+
+for (i in seq_along(combined_consense_gsea)) {
+  tld <- strsplit(as.character(combined_consense_gsea[[i]]$core_enrichment), "/")
+  tld_symbol <- vector("list", length(tld))  # Initialize as empty list
+  
+  for (j in 1:length(tld)) {
+    tld_symbol[j] <- Ensemble_gene_vector_to_symbol_GO(tld[j])
+  }
+  
+  tld_list[[i]] <- make_tld_list(tld_symbol) 
+}
+
+names(tld_list) <- c("H8H0_vs_N8N0", "N8cN0_vs_N8N0", "H8cH0_vs_H8H0", "H8cH0_vs_N8cN0")
+
+make_tld_list(combined_consense_gsea$H8H0_vs_N8N0)
+
+
+for (i in seq_along(combined_consense_gsea)) {
+ tld = strsplit(as.character(combined_consense_gsea[[i]]$core_enrichment), "/")
+combined_consense_gsea[[i]]$shared_genes = find_duplicates(tld)$Listen
+}
+
+combined_consense_gsea <- lapply(combined_consense_gsea, function(df) df %>% mutate(row_number = row_number()))
+combined_consense_gsea$H8H0_vs_N8N0
+
+padj_total_filtered_res_list$R8Gy_vs_N8Gy = NULL
+for(i in 1:length(padj_total_filtered_res_list)){
+padj_total_filtered_res_list[[i]]$symbol = as.vector(Ensemble_gene_vector_to_symbol_GO(row.names(padj_total_filtered_res_list[[i]])))
+}
+
+
+GSEA_Gene_summary = function(tld_l,S,E,threshold = 2){ #,padj_f_l
+combined_gene_list <- unlist(lapply(tld_l[S:E], function(x) x$Gene), recursive = FALSE)
+freq_table = table(unlist(combined_gene_list))
+ss = subset(freq_table, freq_table > threshold)
+#ss = ss[names(ss) %in% padj_f_l$symbol]
+print(ss)
+return(ss)
+}
+
+
+table_list = list(
+table_H8H0= GSEA_Gene_summary(tld_list$H8H0_vs_N8N0,1,2,0),#, padj_total_filtered_res_list$H8Gy_vs_H0G
+table_N8N0 = GSEA_Gene_summary(tld_list$H8H0_vs_N8N0,3,length(tld_list$H8H0_vs_N8N0),0),
+
+table_N8cN0_2 =  GSEA_Gene_summary(tld_list$N8cN0_vs_N8N0 ,1,3,0),
+table_N8N0_2 =  GSEA_Gene_summary(tld_list$N8cN0_vs_N8N0 ,4,7,0),
+
+table_H8cH0_2 = GSEA_Gene_summary(tld_list$H8cH0_vs_H8H0,1,11,0),
+table_H8H0_2 = GSEA_Gene_summary(tld_list$H8cH0_vs_H8H0,12,12,0),
+
+table_H8cH0=  GSEA_Gene_summary(tld_list$H8cH0_vs_N8cN0,1,11,0),
+table_N8cN0= GSEA_Gene_summary(tld_list$H8cH0_vs_N8cN0,12,length(tld_list$H8cH0_vs_N8cN0),0)
+)
+
+
+for (i in seq_along(combined_consense_gsea)){
+  write.csv(combined_consense_gsea[[i]],paste0("C:/Users/Frederik/Desktop/Dokumente/gsea_correct/",names(comb_filter_go)[i],"_",".csv"))
+} #maybe only the anme filter is enough now ?
+filtered_data = list()
+i = 1
+j = 2
+for (tab in 1:4) {
+name = paste0(names(table_list)[i],"_vs_",names(table_list)[j])
+fd = comp_list[[tab]][comp_list[[tab]]$SYMBOL %in% c(names(table_list[[i]]),names(table_list[[j]])), ]
+#print(i)
+#print(j)
+filtered_data[[tab]] = fd
+
+#write.csv(fd,paste0("C:/Users/Frederik/Desktop/Dokumente/Genes_of_interest/",name,".csv"))
+i = i+2
+j = j+2
+}
+padj_total_filtered_res_list
+
+  write.csv(filtered_data,paste0("C:/Users/Frederik/Desktop/Dokumente/Genes_of_interest/",name,".csv"))
+  comb_filter_go$
+```
+###building alist of genes and which go terms belong to them:
+```{r}
+############## this is a mess i wanted to creat a dataframe with all foldchanges for the genes of interest.
+  for(i in 1:length(total_res_list)){
+total_res_list[[i]]$symbol = as.vector(Ensemble_gene_vector_to_symbol_GO(row.names(total_res_list[[i]])))
+}
+df_list = total_res_list
+df_list = lapply(df_list, as.data.frame)
+df_list
+
+list_of_all_int_genes_in_all_groups = list()
+padj_total_filtered_res_list = lapply(padj_total_filtered_res_list , as.data.frame)
+padJ_df_combined = padj_total_filtered_res_list[[1]]
+
+for( i in 2:length(padj_total_filtered_res_list)){
+  padJ_df_combined = rbind(padj_total_filtered_res_list[[i]],padJ_df_combined)
+} 
+symbols2 = unlist(padJ_df_combined$symbol)
+
+padj_df_2 = data.frame(symbol = unique(symbols2) )
+  
+combined_df_2 = padj_df_2
+
+gc()
+for (x in seq_along(df_list)) {
+  
+
+lv= c()
+for (j in 1:length(unlist(df_list[[x]]$symbol))) {
+  lv[j] = (length(unlist(df_list[[x]]$symbol[j])))
+}
+
+df2 = df_list[[x]][lv %in% 1,][,c(2,7)]
+df2$symbol = unlist(df_list[[x]][lv %in% 1,]$symbol)
+names(df2)[1] = paste0(names(df2)[1],"_",x)
+df2 = df2[df2$symbol %in% padj_df_2$symbol,]
+print(merge(combined_df_2,df2 , by = "symbol", all = TRUE))
+list_of_all_int_genes_in_all_groups[[x]] <- merge(combined_df_2,df2 , by = "symbol", all.x = TRUE)
+}
+as.data.frame(list_of_all_int_genes_in_all_groups)
+list_of_all_int_genes_in_all_groups[[1]]
+
+df_list$H8Gy_vs_H0Gy[df_list$H8Gy_vs_H0Gy$symbol %in% padj_df_2$symbol,]
+combined_df_2
+list_of_all_int_genes_in_all_groups[[1]][!duplicated(list_of_all_int_genes_in_all_groups[[1]]$symbol), ]
+
+list_of_all_int_genes_in_all_groups <- lapply(list_of_all_int_genes_in_all_groups, function(df) {
+  df[!duplicated(df$symbol), ]
+})
+as.data.frame(list_of_all_int_genes_in_all_groups)
+
+# Merge all dataframes in the list based on "symbol"
+merged_df <- Reduce(function(x, y) merge(x, y, by = "symbol", all = TRUE), list_of_all_int_genes_in_all_groups)
+
+# Print the merged dataframe
+print(merged_df)
+names(merged_df)[2:25] = names(total_res_list)
+
+gene_names_of_interest = unique(c(filtered_data[[1]]$SYMBOL,filtered_data[[2]]$SYMBOL,filtered_data[[3]]$SYMBOL,filtered_data[[4]]$SYMBOL))
+merged_df[merged_df$symbol %in% gene_names_of_interest, ]
+# Subset dataframe to drop columns containing "R" in their names
+selected_genes_of_interest <- subset(merged_df[merged_df$symbol %in% gene_names_of_interest, ], select = !grepl("R", names(merged_df[merged_df$symbol %in% gene_names_of_interest, ])))
+
+# Print the updated dataframe
+print(updated_df)
+selected_genes_of_interest
+#write.csv(selected_genes_of_interest,paste0("C:/Users/Frederik/Desktop/Dokumente/Genes_of_interest/","selected_genes_of_interest",".csv"))
+#giving names to filtered data
+x = 1
+j = 2
+for (i in 1:(length(table_list)/2)) {
+ names(filtered_data)[i]= print(paste0(names(table_list)[x],"_vs_",names(table_list)[j]))
+  x = x+2
+  j = j+2
+}
+
+
+for( i in 1:4){
+gene_names_of_interest = filtered_data[[i]]$SYMBOL
+merged_df[merged_df$symbol %in% gene_names_of_interest, ]
+selected_genes_of_interest <- subset(merged_df[merged_df$symbol %in% gene_names_of_interest, ], select = !grepl("R", names(merged_df[merged_df$symbol %in% gene_names_of_interest, ])))
+write.csv(selected_genes_of_interest,paste0("C:/Users/Frederik/Desktop/Dokumente/Genes_of_interest/","FC_",names(filtered_data)[i],".csv"))
+print(names(filtered_data)[i])
+}
+names(total_res_list$H8Gy_vs_H8Gy_c
+names(filtered_data)
+
+names(table_list)
+total_res_list$H8Gy_vs_H0Gy
+total_res_list$N8Gy_vs_N0Gy
+  for(i in 1:length(total_res_list)){
+total_res_list[[i]]$symbol = as.vector(Ensemble_gene_vector_to_symbol_GO(row.names(total_res_list[[i]])))
+  }
+
+write_DEG = function(x,up){ 
+for (i in seq_along(x)){
+  if (nrow(x[[i]])== 0){next}
+  else{
+  x[[i]]$symbol = as.vector(Ensemble_gene_vector_to_symbol_GO(row.names(x[[i]])))
+write.csv(x[[i]],paste0("C:/Users/Frederik/Desktop/Dokumente/DEGs/",up,names(x)[i],".csv"))
+  }  
+}
+  return(x)
+}
+
+
+write_DEG(total_diff_expressed_genes_over,"up_")
+write_DEG(total_diff_expressed_genes_under,"down_")
+total_diff_expressed_genes_over
+total_diff_expressed_genes_over$N8Gy_vs_N0Gy
+
+
+````
+
+```{r}
+Hsp = read.csv("C:/Users/Frederik/Desktop/Dokumente/Genes_of_interest/Heatshock.csv", sep = ";")
+NF = read.csv("C:/Users/Frederik/Desktop/Dokumente/NF_KB genes.csv")
+s = comp_list$H8cH0_vs_H8H0[comp_list$H8cH0_vs_H8H0$SYMBOL %in% Hsp$symbol,]$SYMBOL
+s
+comp_list$H8cH0_vs_H8H0[comp_list$H8cH0_vs_H8H0$SYMBOL %in% Hsp$symbol,]
+comp_list$H8cH0_vs_N8cN0[comp_list$H8cH0_vs_N8cN0$SYMBOL %in% Hsp$symbol,]
+comp_list$H8H0_vs_N8N0[comp_list$H8H0_vs_N8N0$SYMBOL %in% Hsp$symbol,]
+comp_list$N8cN0_vs_N8N0[comp_list$N8cN0_vs_N8N0$SYMBOL %in% Hsp$symbol,]
+AKt_p = c("PP2A","RACK1","Akt")
+
+comp_list$H8cH0_vs_H8H0[comp_list$H8cH0_vs_H8H0$SYMBOL %in% NF$ï..GENES,]
+comp_list$H8cH0_vs_N8cN0[comp_list$H8cH0_vs_N8cN0$SYMBOL %in% NF$ï..GENES,]
+comp_list$H8H0_vs_N8N0[comp_list$H8H0_vs_N8N0$SYMBOL %in% NF$ï..GENES,]
+comp_list$N8cN0_vs_N8N0[comp_list$N8cN0_vs_N8N0$SYMBOL %in% NF$ï..GENES,]
+
+
+
+N1 = padj_total_filtered_res_list$N8Gy_vs_N0Gy[padj_total_filtered_res_list$N8Gy_vs_N0Gy$symbol %in% NF$ï..GENES,] %>% as.data.frame() %>% filter(abs(log2FoldChange) > 0.5)
+H1 =padj_total_filtered_res_list$H8Gy_vs_H0Gy[padj_total_filtered_res_list$H8Gy_vs_H0Gy$symbol %in% NF$ï..GENES,] %>% as.data.frame() %>% filter(abs(log2FoldChange) > 0.5)
+N2=padj_total_filtered_res_list$N8Gy_c_vs_N0Gy[padj_total_filtered_res_list$N8Gy_c_vs_N0Gy$symbol %in% NF$ï..GENES,] %>% as.data.frame() %>% filter(abs(log2FoldChange) > 0.5)
+H2 = padj_total_filtered_res_list$H8Gy_c_vs_H0Gy[padj_total_filtered_res_list$H8Gy_c_vs_H0Gy$symbol %in% NF$ï..GENES,] %>% as.data.frame() %>% filter(abs(log2FoldChange) > 0.5)
+H1
+H2
+N1
+N2
+
+
+as.data.frame(N1[N1$symbol %in% N2$symbol,]) %>% filter(abs(log2FoldChange) > 0.5)
+H1[H1$symbol %in% H2$symbol,]
+
+
+
+pheatmap(gene)
+merged_df_ph = merged_df
+rownames(merged_df_ph) = merged_df$symbol
+merged_df_ph$symbol = NULL
+pheatmap(as.matrix(merged_df_ph))
+
+rownames(updated_df) = updated_df$symbol
+updated_df_ph = updated_df
+updated_df_ph$symbol = NULL
+as.matrix(updated_df_ph) %>% pheatmap()
+hc_only =merged_df %>% dplyr::filter(abs(H8Gy_c_vs_H0Gy) > 0.5 & abs(H8Gy_vs_H0Gy) < 0.5 & abs(H8Gy_c_vs_N8Gy_c) > 0.5 & abs(H8Gy_vs_H8Gy_c) > 0.5 & abs(N8Gy_vs_N0Gy) < 0.5 & abs(N8Gy_c_vs_N0Gy) < 0.5)
+selected_genes_of_interest
+
+hc_only[hc_only$symbol %in%  NF$ï..GENES ,] 
+
+merged_df %>% dplyr::filter(symbol == "SEMA3C")
+
+xray_diff_expressed_genes$H8Gy_vs_H0Gy
+cion_diff_expressed_genes$H8Gy_vs_H0Gy
+total_diff_expressed_genes$H8Gy_vs_H0Gy
+total_diff_expressed_genes$H8Gy_c_vs_H0Gy
+````
+
+
