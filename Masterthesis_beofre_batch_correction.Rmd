@@ -1,0 +1,492 @@
+---
+title: "DEseq 2.0"
+author: "Frederik Labonté"
+date: "2023-01-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(digest)
+library(tidyverse)
+library("DESeq2")
+library("pheatmap")
+library("ggVennDiagram")
+```
+
+```{r making one big Matrix}
+# loadin in the data
+nm2 <- list.files(path="C:/Users/Frederik/Desktop/Rawdata/A549", full.names = T)
+A549_total = lapply(nm2, function(x) read.csv(file = x, row.names=1))
+names(A549_total) = gsub(".csv","",list.files(path="C:/Users/Frederik/Desktop/Rawdata/A549", full.names = F)) 
+Metadata_colnames = c("Hypoxie","Radiation","Time","Batch") #col names for metadata
+
+# function to make a big df with each sample and get the meta data
+df_from_list = function(df_list,start=2,end=7){
+a = df_list[[1]]
+for(i in start:end){
+  a = full_join(df_list[[i]],a, by = "ID")
+}
+
+my_df = a
+# Find the Duplicated Columns
+duplicated_columns <- duplicated(sapply(my_df, digest))
+
+# Show the Names of the Duplicated Columns
+colnames(my_df[duplicated_columns])
+
+# Remove the Duplicated Columns
+my_df = my_df[!duplicated_columns]
+colnames(my_df) = gsub(".x","",colnames(my_df))
+rownames(my_df) = my_df$ID
+my_df$ID = NULL
+
+x = my_df
+Metadata_my_df = t(as.data.frame(str_split(colnames(x),"\\."), row.names = Metadata_colnames, col.names = colnames(x)))
+res = list(x ,Metadata_my_df)
+return(res)
+}
+
+# Adding ID and running the necessary steps to get one df
+list_xray = lapply(A549_total[1:7],function(x) cbind(x,"ID" = rownames(x))) %>% df_from_list()
+names(list_xray) = c("df","meta")
+
+list_cion = lapply(A549_total[8:14],function(x) cbind(x,"ID" = rownames(x))) %>% df_from_list()
+names(list_cion) = c("df","meta")
+
+
+
+### checking that the overall amount of reads in each sample and set of samples is comparable 
+sumfun<-function(x,start,end){
+  return(sum(x[start:end]))
+}
+totalreads = function(x){
+vec = c()
+vec[1] = sumfun(x,1,4)
+for (i in 0:4){
+vec[i+2]=  sumfun(x,((i+1)*4)+1,(i+2)*4)
+}
+return(vec)
+}
+cols_xray = colSums(list_xray[[1]]) %>% totalreads()
+cols_cion = colSums(list_cion[[1]]) %>% totalreads()
+
+
+```
+
+```{r}
+#making the xray and cion data differentiable by adding the c to the metadata and col names
+list_cion2 = list_cion
+list_cion2$meta[,4] = as.numeric(list_cion2$meta[,4]) + 4
+
+i = 1
+for(entry in list_cion2$meta[,2]){
+  if(entry == "8Gy"){ 
+    list_cion2$meta[,2][i] = paste0(entry,"_c")
+  }
+  i = i+1
+  }
+rownames(list_cion2$meta) = paste0(gsub("8Gy","8Gy_c",rownames(list_cion2$meta)),".c")
+colnames(list_cion2$df) = paste0(gsub("8Gy","8Gy_c",colnames(list_cion2$df)),".c")
+df_total = cbind(list_xray$df,list_cion2$df)
+meta_total = rbind(list_xray$meta,list_cion2$meta)
+list_total = list(df_total,meta_total)
+names(list_total) = c("df","meta")
+```
+
+```{r Deseq2}
+#Running DESeq
+#xray
+dds <- DESeqDataSetFromMatrix(countData = list_xray[[1]] ,
+                              colData = list_xray[[2]],
+                              design = ~Batch + Radiation + Hypoxie)
+dds$group <- factor(paste0(dds$Hypoxie, dds$Radiation ))
+design(dds) <- ~ Batch + group
+keep <- rowSums(counts(dds)) > 30 #why 30 ? in the original comparisions which were 8 samples we used 10 as a cut off now that they are combined we have 24 samples which is the same as 3*8 so i increased the filter by times 3
+dds <- dds[keep,]
+dds = estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# now for cion
+dds_c <- DESeqDataSetFromMatrix(countData = list_cion[[1]] ,
+                              colData = list_cion[[2]],
+                              design = ~Batch + Radiation + Hypoxie)
+dds_c$group <- factor(paste0(dds_c$Hypoxie, dds_c$Radiation ))
+design(dds_c) <- ~ Batch + group
+keep <- rowSums(counts(dds_c)) > 30 #why 30 ? in the original comparisions which were 8 samples we used 10 as a cut off now that they are combined we have 24 samples which is the same as 3*8 so i increased the filter by times 3
+dds_c <- dds_c[keep,]
+dds_c = estimateSizeFactors(dds_c)
+dds_c <- DESeq(dds_c)
+
+
+#for the combined experiments treating the differences as batch effect
+dds_t <- DESeqDataSetFromMatrix(countData = list_total[[1]] ,
+                              colData = list_total[[2]],
+                              design = ~Batch + Radiation + Hypoxie)
+dds_t$group <- factor(paste0(dds_t$Hypoxie, dds_t$Radiation ))
+design(dds_t) <- ~ Batch + group
+keep <- rowSums(counts(dds_t)) > 60 #why 60 ? in the original comparisions which were 8 samples we used 10 as a cut off now that they are combined we have 48 samples which is the same as 6*8 so i increased the filter by times 6
+dds_t <- dds_t[keep,]
+dds_t = estimateSizeFactors(dds_t)
+dds_t <- DESeq(dds_t)
+```
+
+```{r comparing between groups}
+
+#we create a function which does all the comparing for us between groups
+# defining rules by which order should be compüared we go through all the entries andcompare them according to those rules.
+group_comparisions = function(x = dds, y = levels(dds$group)){ 
+  res_list = list()
+  lev = y
+  List_names = c()
+  nr = 0
+
+  # Function to compare group names
+  compare_names = function(name1, name2){
+    name1_has_zero = grepl('0', name1)
+    name2_has_zero = grepl('0', name2)
+    name1_is_n = grepl('^N', name1)
+    name2_is_n = grepl('^N', name2)
+    name1_is_r = grepl('^R', name1)
+    name2_is_r = grepl('^R', name2)
+
+    # Check if either the number or the letter is the same
+    if (!(substr(name1, 1, 1) == substr(name2, 1, 1) || substr(name1, 2, 3) == substr(name2, 2, 3))){
+      return(c())
+    }
+
+    # Rule 1: Groups with '0' always come second
+    if (name1_has_zero && !name2_has_zero) {
+      return(c(name2, name1))
+    } else if (name2_has_zero && !name1_has_zero) {
+      return(c(name1, name2))
+    }
+
+    # Rule 2: if there is no '0' or both contain a '0', 'N' comes second
+    if (!name1_is_n && name2_is_n) {
+      return(c(name1, name2))
+    } else if (name1_is_n && !name2_is_n) {
+      return(c(name2, name1))
+    }
+
+    # Rule 3: When comparing 'H' and 'R', 'R' comes second
+    if (!name1_is_r && name2_is_r) {
+      return(c(name1, name2))
+    } else if (name1_is_r && !name2_is_r) {
+      return(c(name2, name1))
+    }
+    
+    return(c(name1, name2))
+  }
+
+  for(i in 1:(length(lev)-1)){
+    for(j in (i+1):length(lev)){
+      name_pair = compare_names(lev[[i]], lev[[j]])
+      if(length(name_pair) > 0){
+        nr = nr + 1
+        res_list[[nr]] = na.omit(results(x, contrast=c("group", name_pair[1], name_pair[2]), lfcThreshold = 0.1, alpha  = 0.05))
+        List_names[nr] = paste0(name_pair[1],"_vs_",name_pair[2])
+      }
+    } 
+  }
+  names(res_list) = List_names
+  return(res_list)
+}
+
+
+
+
+
+# saving the results of our comparision
+
+xray_res_list = group_comparisions()
+cion_res_list = group_comparisions(x = dds_c,y = levels(dds_c$group))
+total_res_list = group_comparisions(x = dds_t,y = levels(dds_t$group))
+
+# now we check for differential expressed genes
+xray_diff_expressed_genes = lapply(xray_res_list, function(x) x[x$padj < 0.05 & abs(x$log2FoldChange) > 1 ,] )
+xray_diff_expressed_genes = lapply(xray_diff_expressed_genes, function(x) x[order(x$log2FoldChange),] )
+
+cion_diff_expressed_genes = lapply(cion_res_list, function(x) x[x$padj < 0.05 & abs(x$log2FoldChange) > 1 ,] )
+cion_diff_expressed_genes = lapply(cion_diff_expressed_genes, function(x) x[order(x$log2FoldChange),] )
+
+total_diff_expressed_genes = lapply(total_res_list, function(x) x[x$padj < 0.05 & abs(x$log2FoldChange) > 1 ,] )
+total_diff_expressed_genes = lapply(total_diff_expressed_genes, function(x) x[order(x$log2FoldChange),] )
+
+```
+
+```{r rlog transformed DEseq results}
+rld = rlog(dds)
+rld2 = rld
+assay(rld2) <- limma::removeBatchEffect(assay(rld2), rld2$Batch) # removing the batch effect for visualisation purposes
+
+rld_c = rlog(dds_c)
+rld2_c = rld_c
+assay(rld2_c) <- limma::removeBatchEffect(assay(rld2_c), rld2_c$Batch)
+
+rld_t = rlog(dds_t)
+rld2_t = rld_t
+assay(rld2_t) <- limma::removeBatchEffect(assay(rld2_t), rld2_t$Batch)
+
+````
+```{r plots}
+# Making a custom PCA and dist matrix function
+make_fancy_pca = function(x,int=c("group","Batch"),
+                          m="",sub = "",cap = "", leg = "right", s = 12){
+pcaData <- plotPCA(x, intgroup=int, returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=group.1, shape=Batch)) +
+ geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + 
+  scale_shape_manual(values=c(15, 16, 17, 18,8,9,10,11))+
+  theme(legend.position=leg, legend.box="horizontal", legend.margin=margin(),plot.margin = unit(c(0,0,0,0), "cm"), plot.title = element_text(size=s), text=element_text(size=12,  family="serif"),legend.key.size = unit(0.4, 'cm')) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE)) +
+  labs(title = m,
+              subtitle = sub,
+              caption = cap,
+              fill = "") 
+
+}
+make_dist_m = function(x,m){
+sampleDists <- dist(t(assay(x)))
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(x$group, x$Batch, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors, main = m, treeheight_col = 0 )
+
+}
+
+# get an overview in PDF form
+pdf("dist_matrix&PCA_xray.pdf")
+par(mfrow = c(1, 2))
+make_dist_m(rld,m = "distance matrix x_ray")
+make_dist_m(rld2, m = "distance matrix x_ray \n batch corrected")
+make_fancy_pca(rld,m="PCA x_ray all samples" )
+make_fancy_pca(rld2,m="PCA x_ray all samples batch corrected" )
+dev.off()
+
+make_dist_m(rld,m = "X-ray")
+make_dist_m(rld2, m = "X-ray batch corrected")
+make_dist_m(rld_c,m="C-ion")
+make_dist_m(rld2_c,m="C-ion batch corrected")
+make_dist_m(rld_t,m="total")
+make_dist_m(rld2_t,m="total batch corrected")
+
+pdf("dist_matrix&PCA_cion.pdf")
+make_dist_m(rld_c,m="distance matrix c_ion")
+make_dist_m(rld2_c,m="distance matrix c_ion batch corrected")
+make_fancy_pca(rld_c,m="PCA c_ion all samples")
+make_fancy_pca(rld2_c,m ="PCA c_ion all samples batch corrected")
+dev.off()
+
+pdf("dist_matrix&PCA_total.pdf")
+make_dist_m(rld_t,m="distance matrix total")
+make_dist_m(rld2_t,m="distance matrix total batch corrected")
+make_fancy_pca(rld_t,m="PCA total all samples")
+make_fancy_pca(rld2_t,m ="PCA total all samples batch corrected")
+dev.off()
+
+
+```
+## PCA plots in grid
+```{r aranging PCA plots}
+# the function to arrange the PCAs in Grid
+Arrange_plots = function(plot1,plot2,pname = ""){
+p_no_legend <- list(plot1,plot2)
+legend <- cowplot::get_legend(p_no_legend[[1]] +labs(color = "")+ theme(legend.position = "bottom") )
+
+title <- cowplot::ggdraw() + cowplot::draw_label(pname, fontface = "bold")
+
+p_grid <- cowplot::plot_grid(plotlist = p_no_legend, ncol = 2, labels = "auto", label_size = 12) 
+cowplot::plot_grid(title, p_grid, legend, ncol = 1, rel_heights = c(0.1, 1, 0.2))
+}
+
+#xray
+plot1 = make_fancy_pca(rld,m="All samples before batch correction", leg = "none", s = 12 )
+plot2 = make_fancy_pca(rld2,m="All samples after batch correction", leg = "none", s = 12 )
+
+ggsave("PCA_x_ray_allsamples_2.tiff",plot = Arrange_plots(plot1,plot2, "X-rays A549"), device = "tiff",units = "in", width = 7, height = 5, dpi = 300)
+
+# cion
+ggsave("PCA_Cion_allsamples_2.tiff",plot = Arrange_plots(
+  make_fancy_pca(rld_c,m="All samples before batch correction", leg = "none"),make_fancy_pca(rld2_c,m ="All samples after batch correction",leg = "none"),pname = "C-ions A549"),
+       device = "tiff",units = "in", width = 7, height = 5, dpi = 300)
+
+# total
+plot1 = make_fancy_pca(rld_t,m="All samples before batch correction", leg = "none")
+plot2 = make_fancy_pca(rld2_t,m ="All samples after batch correction", leg = "none")
+ggsave("PCA_total_allsamples_2.tiff",plot = Arrange_plots(plot1,plot2,"combined X-rays and C-ions A549"), device = "tiff",units = "in", width = 7, height = 5, dpi = 300)
+
+
+```
+
+```{r vendiagramms}
+
+Nonsensical_comparisions = c("H8Gy_vs_N0Gy","H8Gy_vs_R0Gy","N8Gy_vs_R0Gy","H0Gy_vs_N8Gy","H0Gy_vs_R8Gy",
+                             "N8Gy_c_vs_R8Gy","H8Gy_c_vs_N8Gy","H8Gy_c_vs_R8Gy","N8Gy_vs_R8Gy_c","H8Gy_vs_R8Gy_c","N0Gy_vs_R8Gy_c","H8Gy_vs_N8Gy_c","H8Gy_c_vs_N0Gy","H8Gy_c_vs_R0Gy","H0Gy_vs_N8Gy_c","N8Gy_c_vs_R0Gy","N0Gy_vs_R8Gy")
+
+only_good_comp_cion = cion_diff_expressed_genes
+only_good_comp_cion = only_good_comp_cion[!names(only_good_comp_cion) %in% Nonsensical_comparisions]
+
+only_good_comp_xray = xray_diff_expressed_genes
+only_good_comp_xray = only_good_comp_xray[!names(only_good_comp_xray) %in% Nonsensical_comparisions]
+
+```
+
+
+```{r correlation testing }
+
+#this part is run 3 times with the different data sets 1 with the not removed outliers
+#then with removed outliers
+#and lastly with rmeoved outliers and batch correction
+
+# trying to get a list of all differentially expressed genes so that we can 
+# compare them between different conditions to see how closely related they behave
+
+#here we gather the list of all differentially expressed genes
+cion_test = cion_diff_expressed_genes[!names(cion_diff_expressed_genes) %in% Nonsensical_comparisions]
+cion_test[[1]]$ID = NULL  
+cion_diff_expressed_genes_df = lapply(cion_test, FUN = as.data.frame)
+cion_diff_expressed_genes_df <- do.call(rbind, cion_diff_expressed_genes_df)
+
+
+xray_test = xray_diff_expressed_genes[names(xray_diff_expressed_genes) %in% Nonsensical_comparisions]
+xray_test[[1]]$ID = NULL  
+xray_diff_expressed_genes_df = lapply(xray_test, FUN = as.data.frame)
+xray_diff_expressed_genes_df <- do.call(rbind, xray_diff_expressed_genes_df)
+
+All_diff_expressed_genes = rbind(xray_diff_expressed_genes_df,cion_diff_expressed_genes_df)
+All_diff_expressed_genes <- All_diff_expressed_genes[!duplicated(rownames(All_diff_expressed_genes)), ]
+All_rnames = rownames(All_diff_expressed_genes)
+
+All_rnames <- sub(".*\\.", "", All_rnames)
+Unique_rnames <- unique(All_rnames)
+
+
+t_nor_count_n = counts(dds_t, normalized=TRUE) #correctedNormalizedCounts is used for testing with batch correction after the next code block was run
+x_nor_count_n = counts(dds, normalized=TRUE)
+c_nor_count_n = counts(dds_c, normalized=TRUE)
+
+x_diff_counts <- subset(x_nor_count_n, row.names(x_nor_count_n) %in% Unique_rnames)
+c_diff_counts = subset(c_nor_count_n, row.names(c_nor_count_n) %in% Unique_rnames)
+# we use the total because only this way the normalized counts are comparable
+t_diff_counts = subset(t_nor_count_n, row.names(t_nor_count_n) %in% Unique_rnames)
+# we split it in two so that we can treat them as seperate x and c for the cor test
+t_diff_count_c <- t_diff_counts[, grepl("c", colnames(t_diff_counts))]
+t_diff_count_x <- t_diff_counts[, !grepl("c", colnames(t_diff_counts))]
+
+
+
+x_diff_counts_df = as.data.frame(x_diff_counts)
+colnames(x_diff_counts_df) = paste0(colnames(x_diff_counts_df),"_x")
+c_diff_counts_df = as.data.frame(c_diff_counts)
+colnames(c_diff_counts_df) = paste0(colnames(c_diff_counts_df),"_c")
+x_c_diff_counts_df = merge(x_diff_counts_df, c_diff_counts_df, by = "row.names")
+rownames(x_c_diff_counts_df) = x_c_diff_counts_df$Row.names 
+x_c_diff_counts_df$Row.names= NULL
+
+
+cor_matrix = function(df){
+vectoren_liste <- as.list(df)
+
+n <- length(vectoren_liste)
+korrelationen <- matrix(nrow = n, ncol = n)
+
+for(i in 1:(n-1)) {
+    for(j in (i+1):n) {
+        # Berechnen Sie die Korrelation zwischen den Vektoren i und j
+        korrelationen[i, j] <- cor(vectoren_liste[[i]], vectoren_liste[[j]], method = "spearman")
+        korrelationen[j, i] <- korrelationen[i, j]  # Symmetrie in der Matrix ausnutzen
+    }
+}
+
+colnames(korrelationen) = colnames(df)
+rownames(korrelationen) = colnames(df)
+return(korrelationen)
+}
+t_diff_counts_df = as.data.frame(t_diff_counts)
+
+
+# here we make heatmaps of the correlation between samples these were not used in the end
+pheatmap(cor_matrix(x_diff_counts_df))
+pheatmap(cor_matrix(c_diff_counts_df))
+pheatmap(cor_matrix(x_c_diff_counts_df))
+pheatmap(cor_matrix(t_diff_counts_df))
+
+
+df <- as.data.frame(t_diff_count_x)
+
+get_0_list =  function(df){
+# gather indicies of rownames containg 0
+spalten_mit_0_x <- grep("0", colnames(df))
+
+# and creat a df with only those indicies
+df_mit_0_x <- df[, spalten_mit_0_x]
+
+spalten_mit_R_x <- grepl("R", colnames(df_mit_0_x))
+df_mit_0_R_x = df_mit_0_x[,spalten_mit_R_x]
+spalten_mit_H_x <- grepl("H", colnames(df_mit_0_x))
+df_mit_0_H_x = df_mit_0_x[,spalten_mit_H_x]
+spalten_mit_N_x <- grepl("N", colnames(df_mit_0_x))
+df_mit_0_N_x = df_mit_0_x[,spalten_mit_N_x]
+list_mit_0_x = list(df_mit_0_R_x,df_mit_0_H_x,df_mit_0_N_x,df_mit_0)
+names(list_mit_0_x) = c("R","H","N")
+return(
+  list_mit_0_x
+)
+}
+
+## here we gather the correlation values that are used in the masterthesis
+# the division of the sum in the end is done by hand
+average_cor = function(x){
+  rowSums(cor_matrix(x), na.rm=TRUE)/(length(x)-1)
+}
+divide_by_4 = function(x){return(x/4)}
+list_mit_0_x = get_0_list(as.data.frame(t_diff_count_x))
+lapply(list_mit_0_x,average_cor ) %>% lapply(sum) #%>% lapply(divide_by_4)
+
+list_mit_0_c = get_0_list(as.data.frame(t_diff_count_c))
+lapply(list_mit_0_c,average_cor) %>% lapply(sum) #%>% lapply(divide_by_4)
+lapply(list_mit_0_x[[1]], cor_matrix)
+
+list_mit_0 = get_0_list(as.data.frame(t_diff_counts))
+lapply(list_mit_0,average_cor) %>% lapply(sum)
+
+```
+
+
+```{r}
+#RUN cor again with removed batch effects !!
+
+library(sva)             # Load the 'sva' package
+batchInfo = matrix(nrow = 45, ncol = 2)
+batchInfo[,1] = rownames(list_total$meta)
+batchInfo[,2] = list_total$meta[,4]
+colnames(batchInfo) = c("sampleName",  "batch")
+batchInfo = as.data.frame(batchInfo)
+# Convert normalized counts to log2 counts per million (logCPM)
+logCPM <- log2(t_nor_count_n + 1)
+
+# Create a model matrix based on the batch information
+mod <- model.matrix(~ 1, data = batchInfo)
+
+# Run ComBat to remove batch effects
+combatData <- ComBat(dat = logCPM, batch = batchInfo$batch, mod = mod)
+
+# Convert the batch-corrected data back to normalized counts
+correctedNormalizedCounts <- (2^combatData)- 1
+
+correctedNormalizedCounts
+
+
+```
+
